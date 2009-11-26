@@ -417,7 +417,9 @@ static void processInputBuffer(redisClient *c);
 static zskiplist *zslCreate(void);
 static void zslFree(zskiplist *zsl);
 static void zslInsert(zskiplist *zsl, double score, robj *obj);
+static zskiplistNode *nodeSubsequent(zskiplistNode *node, int reversOrder);
 static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int mask);
+
 
 static void authCommand(redisClient *c);
 static void pingCommand(redisClient *c);
@@ -491,6 +493,12 @@ static void zrevrangeCommand(redisClient *c);
 static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
+static void zrangeunionCommand(redisClient *c);
+static void zrevrangeunionCommand(redisClient *c);
+static void zunionstoreCommand(redisClient *c);
+static void zdiffrangeCommand(redisClient *c);
+static void zdiffrevrangeCommand(redisClient *c);
+static void zinterstoreCommad(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
 
 /*================================= Globals ================================= */
@@ -540,6 +548,12 @@ static struct redisCommand cmdTable[] = {
     {"zrevrange",zrevrangeCommand,4,REDIS_CMD_INLINE},
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
+    {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zrevrangeunion",zrevrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zunionstore", zunionstoreCommand, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zdiffrange", zdiffrangeCommand, -4, REDIS_CMD_INLINE},
+    {"zdiffrevrange", zdiffrevrangeCommand, -4, REDIS_CMD_INLINE},
+    {"zinterstore", zinterstoreCommad, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -4293,6 +4307,11 @@ static int zslDelete(zskiplist *zsl, double score, robj *obj) {
     return 0; /* not found */
 }
 
+/* Get next or previous zskiplistNode */
+static zskiplistNode *nodeSubsequent(zskiplistNode *node, int reverse) {
+    return reverse ? node->backward : node->forward[0];
+}
+
 /* Delete all the elements with score between min and max from the skiplist.
  * Min and mx are inclusive, so a score >= min || score <= max is deleted.
  * Note that this function takes the reference to the hash table view of the
@@ -4555,6 +4574,7 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
             }
 
             addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
+
             for (j = 0; j < rangelen; j++) {
                 ele = ln->obj;
                 addReplyBulkLen(c,ele);
@@ -4685,6 +4705,249 @@ static void zscoreCommand(redisClient *c) {
         }
     }
 }
+
+/* No support for negative inexed for now */
+static void zrangeuniondiffGenericCommand(redisClient *c, int toskip, int togo, robj **setskeys, unsigned int setsnum, int reverse, int op) {
+    zskiplistNode **zskiplistNodes = zmalloc(sizeof(zskiplistNode*)*setsnum);
+    unsigned int  j, actualnum = 0;
+    robj *zsetobj;
+
+    for (j = 0; j < setsnum; j++) {
+        zsetobj = lookupKeyRead(c->db,setskeys[j]);
+        if (!zsetobj) continue;
+        if (zsetobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            goto exit;
+        }
+        zskiplistNodes[actualnum++] = reverse ? ((zset*)zsetobj->ptr)->zsl->tail :
+            ((zset*)zsetobj->ptr)->zsl->header->forward[0];
+    }
+    
+    if (!actualnum) {
+        addReply(c,shared.emptymultibulk);
+        goto exit;
+    }
+
+    zsetobj = createZsetObject();
+    double *score;
+    robj *ele;
+    zset *zs = zsetobj->ptr;
+    int index = 0; // initialization is not needed actually, but gcc gives warning without it
+
+    while(togo) {
+        if(REDIS_OP_DIFF == op)
+            while (zskiplistNodes[0] && togo) {
+                score = malloc(sizeof(double));
+                *score = zskiplistNodes[0]->score;
+                ele = zskiplistNodes[0]->obj;
+
+                dictAdd(zs->dict, ele, score);
+                incrRefCount(ele);
+                zslInsert(zs->zsl, *score, ele);
+                incrRefCount(ele);
+                ++server.dirty;
+                zskiplistNodes[0] = nodeSubsequent(zskiplistNodes[0], reverse);
+                togo--;
+            }
+        score = NULL;
+        j = (op == REDIS_OP_UNION ? 0 : 1);
+        for(; j < actualnum; j++) {
+            if  (zskiplistNodes[j] == NULL) continue;
+            if (score == NULL || (reverse ? (zskiplistNodes[j]->score > *score) :  (zskiplistNodes[j]->score < *score))) {
+                score = &zskiplistNodes[j]->score;
+                index = j;
+            }
+        }
+        if(score == NULL) break;
+
+        ele = zskiplistNodes[index]->obj;
+
+        if(REDIS_OP_UNION == op) {
+            if(dictAdd(zs->dict,ele, score) == DICT_OK) {
+                incrRefCount(ele);
+                zslInsert(zs->zsl, *score, ele);
+                incrRefCount(ele);
+                ++server.dirty;
+                --togo;
+            }
+        } else {
+            if(zslDelete(zs->zsl, *score, ele)) {
+                ++server.dirty;
+                ++ togo;
+            }
+        }
+        zskiplistNodes[index] = nodeSubsequent(zskiplistNodes[index], reverse);
+    }
+
+
+    long unsigned rangelen = zs->zsl->length - toskip;
+    zskiplistNode *ln = reverse ? zs->zsl->tail : zs->zsl->header->forward[0];
+    
+    while (toskip--)
+        ln = nodeSubsequent(ln, reverse);
+
+    addReplySds(c,sdscatprintf(sdsempty(),"*%lu\r\n", rangelen));
+    
+    for (j = 0; j < rangelen; j++) {
+        ele = ln->obj;
+        addReplyBulkLen(c,ele);
+        addReply(c,ele);
+        addReply(c,shared.crlf);
+        ln = nodeSubsequent(ln, reverse);
+    }
+
+exit:
+   zfree(zskiplistNodes);
+}
+
+static void zrangeunionCommand(redisClient *c) {
+    zrangeuniondiffGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 0, REDIS_OP_UNION);
+}
+
+static void zrevrangeunionCommand(redisClient *c) {
+    zrangeuniondiffGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 1, REDIS_OP_UNION);
+}
+
+static void zdiffrangeCommand(redisClient *c) {
+    int toskip = atoi(c->argv[1]->ptr);
+    int togo =      atoi(c->argv[2]->ptr);
+    zrangeuniondiffGenericCommand(c, toskip, togo, c->argv+3, c->argc-3, 0, REDIS_OP_DIFF);
+}
+
+static void zdiffrevrangeCommand(redisClient *c) {
+    int toskip = atoi(c->argv[1]->ptr);
+    int togo =      atoi(c->argv[2]->ptr);
+    zrangeuniondiffGenericCommand(c, toskip, togo, c->argv+3, c->argc-3, 1, REDIS_OP_DIFF);
+}
+
+static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, unsigned setsnum, robj *dstkey) {
+    zskiplistNode **zskiplistNodes = zmalloc(sizeof(zskiplistNode*)*setsnum);
+    unsigned j, actualnum = 0;
+    robj *zsetobj, *ele;
+    zset *zs;
+    double *score;
+
+    // TODO extract function from here and zunionrange
+    for (j = 0; j < setsnum; j++) {
+        zsetobj = lookupKeyRead(c->db,setskeys[j]);
+        if (!zsetobj) continue;
+        if (zsetobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            goto exit;
+        }
+        zskiplistNodes[actualnum++] = ((zset*)zsetobj->ptr)->zsl->header->forward[0];
+    }
+
+    if (!actualnum) {
+        addReply(c,shared.emptymultibulk);
+        goto exit;
+    }
+    // END TODO
+
+    zsetobj = createZsetObject();
+    zs = zsetobj->ptr;
+
+    
+    while(actualnum--) {
+        while(zskiplistNodes[actualnum]) {
+            ele = zskiplistNodes[actualnum]->obj;
+            score =  zmalloc(sizeof(double));
+            *score = zskiplistNodes[actualnum]->score;
+
+            if(dictAdd(zs->dict, ele, score) == DICT_OK) {
+                incrRefCount(ele);
+                zslInsert(zs->zsl, *score, ele);
+                incrRefCount(ele);
+                server.dirty++;
+            }
+            zskiplistNodes[actualnum] = zskiplistNodes[actualnum]->forward[0];
+        }
+    }
+
+    if(dictReplace(c->db->dict,dstkey,zsetobj))
+        incrRefCount(dstkey);
+
+    addReplySds(c,sdscatprintf(sdsempty(),":%lu\r\n", dictSize(zs->dict)));
+    server.dirty++;
+        
+    exit:
+        zfree(zskiplistNodes);
+}
+
+static void zunionstoreCommand(redisClient *c) {
+    zunionstoreGenericCommand(c, c->argv+2, c->argc-2, c->argv[1]);
+}
+
+static void zinterstoreGenericCommand(redisClient *c, robj **setskeys, unsigned setsnum, robj *dstkey) {
+//     zskiplistNode **zskiplistNodes = zmalloc(sizeof(zskiplistNode*)*setsnum);
+     zset **zsets = zmalloc(sizeof(zset*)*setsnum);
+     zskiplistNode *node;
+    robj *zsetobj, *ele;
+    zset *zs = NULL, *dstzs;
+    unsigned j, actualnum = 0, shortestlen = -1, shortestindex = -1;
+    double *score = NULL;
+
+    // TODO extract function from here and zunionrange
+    for (j = 0; j < setsnum; j++) {
+        zsetobj = lookupKeyRead(c->db,setskeys[j]);
+        if (!zsetobj) continue;
+        if (zsetobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            goto exit;
+        }
+        zs = ((zset*)zsetobj->ptr);
+
+        if(actualnum == 0 || dictSize(zs->dict) < shortestlen) {
+            shortestlen = dictSize(zs->dict);
+            shortestindex = actualnum;
+        }
+        zsets[actualnum++] = zs;
+    }
+
+    if (!actualnum) {
+        addReply(c,shared.emptymultibulk);
+        goto exit;
+    }
+
+
+     zsetobj = createZsetObject();
+     dstzs = zsetobj->ptr;
+     node = zsets[shortestindex]->zsl->header->forward[0];
+
+     while(node) {
+         for(j =0; j < actualnum; j++) {
+             if(j  == shortestindex) continue;
+             if(dictFind(zsets[j]->dict, node->obj) == NULL) break;
+         }
+         if(j == actualnum) {
+            score =  zmalloc(sizeof(double));
+            *score = node->score;
+            ele = node->obj;
+            dictAdd(dstzs->dict, node->obj, score);
+            incrRefCount(ele);
+            zslInsert(dstzs->zsl, *score, ele);
+            incrRefCount(ele);
+            server.dirty++;
+         }
+        node = node->forward[0];
+     }
+
+    if(dictReplace(c->db->dict,dstkey,zsetobj))
+        incrRefCount(dstkey);
+
+     unsigned long l = dictSize(dstzs->dict);
+     redisLog(REDIS_DEBUG, "%lu", l);
+    addReplySds(c,sdscatprintf(sdsempty(),":%lu\r\n", l));
+    server.dirty++;
+
+    exit:
+        zfree(zsets);
+}
+
+static void zinterstoreCommad(redisClient *c) {
+    zinterstoreGenericCommand(c, c->argv+2, c->argc-2, c->argv[1]);
+}
+
 
 /* ========================= Non type-specific commands  ==================== */
 
@@ -4838,6 +5101,7 @@ static void sortCommand(redisClient *c) {
     /* Now we need to protect sortval incrementing its count, in the future
      * SORT may have options able to overwrite/delete keys during the sorting
      * and the sorted key itself may get destroied */
+
     incrRefCount(sortval);
 
     /* The SORT command has an SQL-alike syntax, parse it */
