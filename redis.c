@@ -473,6 +473,8 @@ static void zrevrangeCommand(redisClient *c);
 static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
+static void zunionCommand(redisClient *c);
+static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey, int op);
 static void zremrangebyscoreCommand(redisClient *c);
 
 /*================================= Globals ================================= */
@@ -522,6 +524,7 @@ static struct redisCommand cmdTable[] = {
     {"zrevrange",zrevrangeCommand,4,REDIS_CMD_INLINE},
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
+    {"zunion",zunionCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -4582,6 +4585,58 @@ static void zscoreCommand(redisClient *c) {
         }
     }
 }
+
+static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey, int op) {
+    // At the moment:
+    // dstkey is never userd
+    // op is allways REDIS_OP_UNION
+
+    zset **zv = zmalloc(sizeof(zset*)*setsnum);
+    double *score;
+    int j, cardinality = 0;
+    dictIterator *di;
+    dictEntry *de;
+    robj *zsetobj;
+
+    for (j = 0; j < setsnum; j++) {
+        zsetobj = lookupKeyWrite(c->db,setskeys[j]);
+        if (!zsetobj) {
+            zv[j] = NULL;
+            continue;
+        }
+        if (zsetobj->type != REDIS_ZSET) {
+            zfree(zv);
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+        zv[j] = zsetobj->ptr;
+    }
+    
+    zset* zs = createZsetObject();
+    robj* elem;
+    
+
+    for (j = 0; j < setsnum; j++) {
+      if(!zv[j]) continue;
+
+      di = dictGetIterator(zv[j]->dict);
+      while(de=dictNext(di)) {
+          // don't care if key already exist - no return value check
+          //dictAdd(zs[j]->dict, dictGetEntryKey(de), dictGetEntryVal(de));
+        
+      }
+    }
+
+
+    
+
+}
+
+static void zunionCommand(redisClient *c) {
+    zunionDiffGenericCommand(c,c->argv+1,c->argc-1, NULL, REDIS_OP_UNION);
+}
+
+
 
 /* ========================= Non type-specific commands  ==================== */
 
