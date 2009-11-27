@@ -4626,17 +4626,15 @@ static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
             ele = dictGetEntryKey(de);
             score = dictGetEntryVal(de);
 
-            redisLog(REDIS_DEBUG, "about to add %f", *score);
-            
             if (dictAdd(zs->dict,ele,score) == DICT_OK) {
-                redisLog(REDIS_DEBUG, "added");
+                redisLog(REDIS_DEBUG, "added (elem:score) %s:%f", getDecodedObject(ele)->ptr, *score);
                 incrRefCount(ele); /* added to hash */
                 zslInsert(zs->zsl,*score,ele);
                 incrRefCount(ele); /* added to skiplist */
                 server.dirty++;
                 cardinality++;
             } else {// else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
-                redisLog(REDIS_DEBUG, "not added");
+                redisLog(REDIS_DEBUG, "not added (elem:score) %s:%f", getDecodedObject(ele)->ptr, *score);
             }
         }
         dictReleaseIterator(di);
