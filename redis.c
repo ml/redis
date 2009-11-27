@@ -4599,7 +4599,7 @@ static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
     robj *zsetobj;
 
     for (j = 0; j < setsnum; j++) {
-        zsetobj = lookupKeyWrite(c->db,setskeys[j]);
+        zsetobj = lookupKeyRead(c->db,setskeys[j]);
         if (!zsetobj) {
             zv[j] = NULL;
             continue;
@@ -4612,24 +4612,54 @@ static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
         zv[j] = zsetobj->ptr;
     }
     
-    zset* zs = createZsetObject();
-    robj* elem;
-    
+    zsetobj = createZsetObject();
+    zset* zs = zsetobj->ptr;
+    robj* ele;
 
     for (j = 0; j < setsnum; j++) {
-      if(!zv[j]) continue;
-
-      di = dictGetIterator(zv[j]->dict);
-      while(de=dictNext(di)) {
-          // don't care if key already exist - no return value check
-          //dictAdd(zs[j]->dict, dictGetEntryKey(de), dictGetEntryVal(de));
+        if(!zv[j]) continue;
         
-      }
+        //redisLog("zset key: %s", setskeys[j]);
+        di = dictGetIterator(zv[j]->dict);
+        
+        while(de=dictNext(di)) {
+            ele = dictGetEntryKey(de);
+            score = dictGetEntryVal(de);
+
+            redisLog(REDIS_DEBUG, "about to add %f", *score);
+            
+            if (dictAdd(zs->dict,ele,score) == DICT_OK) {
+                redisLog(REDIS_DEBUG, "added");
+                incrRefCount(ele); /* added to hash */
+                zslInsert(zs->zsl,*score,ele);
+                incrRefCount(ele); /* added to skiplist */
+                server.dirty++;
+                cardinality++;
+            } else {// else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
+                redisLog(REDIS_DEBUG, "not added");
+            }
+        }
+        dictReleaseIterator(di);
     }
 
+    di = dictGetIterator(zs->dict);
 
-    
+    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",cardinality));
+    di = dictGetIterator(zs->dict);
 
+    while((de = dictNext(di)) != NULL) {
+        robj *ele;
+        ele = dictGetEntryKey(de);
+        addReplyBulkLen(c,ele);
+        addReply(c,ele);
+        addReply(c,shared.crlf);
+    }
+    dictReleaseIterator(di);
+
+    // cleanup
+
+   decrRefCount(zs);
+   zfree(zv);
 }
 
 static void zunionCommand(redisClient *c) {
