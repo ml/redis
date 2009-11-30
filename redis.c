@@ -4588,11 +4588,6 @@ static void zscoreCommand(redisClient *c) {
 }
 
 static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
-    // At the moment:
-    // dstkey is never userd
-    // op is allways REDIS_OP_UNION
-    //c->argv+1,c->argc-1
-    // robj **setskeys, int setsnum, robj *dstkey,
     int start = atoi(c->argv[1]->ptr);
     int end = atoi(c->argv[2]->ptr);
     robj **setskeys = c->argv+3;
@@ -4634,15 +4629,12 @@ static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
             score = dictGetEntryVal(de);
 
             if (dictAdd(zs->dict,ele,score) == DICT_OK) {
-                redisLog(REDIS_DEBUG, "added (elem:score) %s:%f", getDecodedObject(ele)->ptr, *score);
                 incrRefCount(ele); /* added to hash */
                 zslInsert(zs->zsl,*score,ele);
                 incrRefCount(ele); /* added to skiplist */
                 server.dirty++;
                 cardinality++;
-            } else {// else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
-                redisLog(REDIS_DEBUG, "not added (elem:score) %s:%f", getDecodedObject(ele)->ptr, *score);
-            }
+            } // else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
         }
         dictReleaseIterator(di);
     }
@@ -4681,7 +4673,6 @@ static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
     }
 
     addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
-    redisLog(REDIS_DEBUG, "%i", rangelen);
     
     for (j = 0; j < rangelen; j++) {
         ele = ln->obj;
