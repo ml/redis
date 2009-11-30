@@ -473,8 +473,8 @@ static void zrevrangeCommand(redisClient *c);
 static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
-static void zunionCommand(redisClient *c);
-static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey, int op);
+static void zrangeunionCommand(redisClient *c);
+static void zrangeunionfGenericCommand(redisClient *c, int reverse);
 static void zremrangebyscoreCommand(redisClient *c);
 
 /*================================= Globals ================================= */
@@ -524,7 +524,7 @@ static struct redisCommand cmdTable[] = {
     {"zrevrange",zrevrangeCommand,4,REDIS_CMD_INLINE},
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"zunion",zunionCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -4476,6 +4476,7 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
             }
 
             addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
+
             for (j = 0; j < rangelen; j++) {
                 ele = ln->obj;
                 addReplyBulkLen(c,ele);
@@ -4586,10 +4587,16 @@ static void zscoreCommand(redisClient *c) {
     }
 }
 
-static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey, int op) {
+static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
     // At the moment:
     // dstkey is never userd
     // op is allways REDIS_OP_UNION
+    //c->argv+1,c->argc-1
+    // robj **setskeys, int setsnum, robj *dstkey,
+    int start = atoi(c->argv[1]->ptr);
+    int end = atoi(c->argv[2]->ptr);
+    robj **setskeys = c->argv+3;
+    int setsnum = c->argc-3;
 
     zset **zv = zmalloc(sizeof(zset*)*setsnum);
     double *score;
@@ -4639,20 +4646,50 @@ static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
         }
         dictReleaseIterator(di);
     }
+    
+    zskiplist *zsl = zs->zsl;
+    zskiplistNode *ln;
+    ln = zsl->header->forward[0];
 
-    di = dictGetIterator(zs->dict);
+    int llen = zsl->length;
+    int rangelen;
 
-    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",cardinality));
-    di = dictGetIterator(zs->dict);
+    /* convert negative indexes */
+    if (start < 0) start = llen+start;
+    if (end < 0) end = llen+end;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
 
-    while((de = dictNext(di)) != NULL) {
-        robj *ele;
-        ele = dictGetEntryKey(de);
+    /* indexes sanity checks */
+    if (start > end || start >= llen) {
+        /* Out of range start or start > end result in empty list */
+        addReply(c,shared.emptymultibulk);
+        return;
+    }
+    if (end >= llen) end = llen-1;
+    rangelen = (end-start)+1;
+
+    /* Return the result in form of a multi-bulk reply */
+    if (reverse) {
+        ln = zsl->tail;
+        while (start--)
+            ln = ln->backward;
+    } else {
+        ln = zsl->header->forward[0];
+        while (start--)
+            ln = ln->forward[0];
+    }
+
+    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
+    redisLog(REDIS_DEBUG, "%i", rangelen);
+    
+    for (j = 0; j < rangelen; j++) {
+        ele = ln->obj;
         addReplyBulkLen(c,ele);
         addReply(c,ele);
         addReply(c,shared.crlf);
+        ln = reverse ? ln->backward : ln->forward[0];
     }
-    dictReleaseIterator(di);
 
     // cleanup
 
@@ -4660,8 +4697,12 @@ static void zunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
    zfree(zv);
 }
 
-static void zunionCommand(redisClient *c) {
-    zunionDiffGenericCommand(c,c->argv+1,c->argc-1, NULL, REDIS_OP_UNION);
+static void zrangeunionCommand(redisClient *c) {
+    zrangeunionfGenericCommand(c, 0);
+}
+
+static void zrevrangeUnionCommand(redisClient *c) {
+    zrangeunionfGenericCommand(c, 1);
 }
 
 
