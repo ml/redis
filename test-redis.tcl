@@ -1011,17 +1011,18 @@ proc main {server port} {
         list $v1 $v2 [$r zscore zset foo] [$r zscore zset bar]
     } {{bar foo} {foo bar} -2 6}
 
-   test {ZUNION - with two zsets } {
+   test {ZUNIONSTORE - with three zsets} {
        $r zadd zsetu1 1 1
        $r zadd zsetu1 2 2
-       $r zadd zsetu1 8 8
-       $r zadd zsetu1 5 5
-
+       $r zadd zsetu1 8 8 
+       $r zadd zsetu2 5 5
        $r zadd zsetu2 1 1
-       $r zadd zsetu2 4 4
-       $r zadd zsetu2 8 8
-       [$r zrangeunion 0 5 zsetu1 zsetu2]
-   } { list - }
+       $r zadd zsetu3 4 4
+       $r zadd zsetu3 8 8
+      
+       $r zunionstore dest zsetu1 zsetu2 zsetu3
+       $r zrange dest 0 10
+   } {1 2 4 5 8}
 
     test {EXPIRE - don't set timeouts multiple times} {
         $r set x foobar
