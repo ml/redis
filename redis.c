@@ -475,6 +475,7 @@ static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
 static void zrangeunionCommand(redisClient *c);
 static void zrangeunionfGenericCommand(redisClient *c, int reverse);
+static void zunionstoreCommand(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
 
 /*================================= Globals ================================= */
@@ -525,6 +526,7 @@ static struct redisCommand cmdTable[] = {
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zunionstore", zunionstoreCommand, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -4696,6 +4698,67 @@ static void zrevrangeUnionCommand(redisClient *c) {
     zrangeunionfGenericCommand(c, 1);
 }
 
+static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey) {
+    zset **zv = zmalloc(sizeof (zset*) * setsnum);
+    double *score;
+    int j, cardinality = 0;
+    dictIterator *di;
+    dictEntry *de;
+    robj *zsetobj;
+
+    for (j = 0; j < setsnum; j++) {
+        zsetobj = lookupKeyRead(c->db, setskeys[j]);
+        if (!zsetobj) {
+            zv[j] = NULL;
+            continue;
+        }
+        if (zsetobj->type != REDIS_ZSET) {
+            zfree(zv);
+            addReply(c, shared.wrongtypeerr);
+            return;
+        }
+        zv[j] = zsetobj->ptr;
+    }
+
+    zsetobj = createZsetObject();
+    zset* zs = zsetobj->ptr;
+    robj* ele;
+
+    for (j = 0; j < setsnum; j++) {
+        if (!zv[j]) continue;
+
+        di = dictGetIterator(zv[j]->dict);
+
+        while (de = dictNext(di)) {
+            ele = dictGetEntryKey(de);
+            score = dictGetEntryVal(de);
+
+            if (dictAdd(zs->dict, ele, score) == DICT_OK) {
+                incrRefCount(ele); /* added to hash */
+                zslInsert(zs->zsl, *score, ele);
+                incrRefCount(ele); /* added to skiplist */
+                server.dirty++;
+                cardinality++;
+            } // else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
+        }
+        dictReleaseIterator(di);
+    }
+
+    deleteKey(c->db,dstkey);
+    dictAdd(c->db->dict,dstkey,zsetobj);
+    incrRefCount(dstkey);
+
+    redisLog(REDIS_DEBUG, "key %s\n",  *dstkey);
+
+    addReplySds(c,sdscatprintf(sdsempty(),":%d\r\n",
+        dictSize((dict*)zsetobj->ptr)));
+    server.dirty++;
+    zfree(zv);
+}
+
+static void zunionstoreCommand(redisClient *c) {
+    zunionstoreGenericCommand(c, c->argv+2, c->argc-2, c->argv[1]);
+}
 
 
 /* ========================= Non type-specific commands  ==================== */
