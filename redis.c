@@ -4611,6 +4611,8 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
         actualnum++;
     }
 
+    // TODO: goto :exit if actualnum == 0
+
     dictIterator **dictIterators = zmalloc(sizeof(dictIterator*)*actualnum);
     dictEntry **dictEntries = zmalloc(sizeof(dictEntry*)*actualnum);
 
@@ -4624,20 +4626,22 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
     int cardinality = 0;
 
     double *score;
-    double *minscore
+    double *minscore = NULL;
     robj *ele;
     zset *zs = zsetobj->ptr;
 
     // no support for rev for now
     int toSkip = start;
     int togo = end - start;
-    int minIndex;
+    int minIndex = 0;
 
+    redisLog(REDIS_DEBUG, "start: %d end: %d togo: %d", start, end, togo);
 
     while(togo) {
-        for(j = 0; actualnum; j++) {
+
+        for(j = 0; j < actualnum; j++) {
             score = dictGetEntryVal(dictEntries[j]);
-            if(minscore == NULL || minscore > score) {
+            if(minscore == NULL || *minscore > *score) {
                 minscore = score;
                 minIndex = j;
             }
@@ -4645,90 +4649,48 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
 
         ele = dictGetEntryKey(dictEntries[minIndex]);
         score = dictGetEntryVal(dictEntries[minIndex]);
-        
+
+        redisLog(REDIS_DEBUG, "minscore: %d", *minscore);
+        redisLog(REDIS_DEBUG, "minindex: %d", minIndex);
+        redisLog(REDIS_DEBUG, "score: %f", *score);
+
         if (dictAdd(zs->dict,ele,score) == DICT_OK) {
+            redisLog(REDIS_DEBUG, "dict ok, togo: %d", togo);
             incrRefCount(ele); /* added to hash */
             zslInsert(zs->zsl,*score,ele);
             incrRefCount(ele); /* added to skiplist */
             server.dirty++;
             cardinality++;
+            dictEntries[minIndex] = dictNext(dictIterators[minIndex]);
             togo--;
         } else { // this score already exist in set - skip it
+            redisLog(REDIS_DEBUG, "dict not ok, togo: %d", togo);
             continue;
         }
-        
-
-
     }
 
-    for (j = 0; j < setsnum; j++) {
-        if(!zv[j]) continue;
-        
-        //redisLog("zset key: %s", setskeys[j]);
-        di = dictGetIterator(zv[j]->dict);
-        
-        while(de=dictNext(di)) {
-            ele = dictGetEntryKey(de);
-            score = dictGetEntryVal(de);
-
-            if (dictAdd(zs->dict,ele,score) == DICT_OK) {
-                incrRefCount(ele); /* added to hash */
-                zslInsert(zs->zsl,*score,ele);
-                incrRefCount(ele); /* added to skiplist */
-                server.dirty++;
-                cardinality++;
-            } // else don't care if key alredy exists - consider the first score of the first element as a score for all the elements
-        }
-        dictReleaseIterator(di);
-    }
-    
     zskiplist *zsl = zs->zsl;
     zskiplistNode *ln;
     ln = zsl->header->forward[0];
 
-    int llen = zsl->length;
-    int rangelen;
-
-    /* convert negative indexes */
-    if (start < 0) start = llen+start;
-    if (end < 0) end = llen+end;
-    if (start < 0) start = 0;
-    if (end < 0) end = 0;
-
-    /* indexes sanity checks */
-    if (start > end || start >= llen) {
-        /* Out of range start or start > end result in empty list */
-        addReply(c,shared.emptymultibulk);
-        return;
-    }
-    if (end >= llen) end = llen-1;
-    rangelen = (end-start)+1;
-
-    /* Return the result in form of a multi-bulk reply */
-    if (reverse) {
-        ln = zsl->tail;
-        while (start--)
-            ln = ln->backward;
-    } else {
-        ln = zsl->header->forward[0];
-        while (start--)
-            ln = ln->forward[0];
-    }
-
-    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
+    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n", zsl->length));
     
-    for (j = 0; j < rangelen; j++) {
+    for (j = 0; j < zsl->length; j++) {
         ele = ln->obj;
         addReplyBulkLen(c,ele);
-        addReply(c,ele);
+         addReply(c,ele);
         addReply(c,shared.crlf);
-        ln = reverse ? ln->backward : ln->forward[0];
+        ln = ln->forward[0];
     }
 
     // cleanup
 
    decrRefCount(zs);
+
+   // label :exit
    zfree(zv);
+   zfree(dictIterators);
+   zfree(dictEntries);
 }
 
 static void zrangeunionCommand(redisClient *c) {
@@ -4736,7 +4698,7 @@ static void zrangeunionCommand(redisClient *c) {
 }
 
 static void zrevrangeUnionCommand(redisClient *c) {
-    zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 0);
+    //zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 1);
 }
 
 static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey) {

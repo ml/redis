@@ -1023,6 +1023,10 @@ proc main {server port} {
        $r zunionstore dest zsetu1 zsetu2 zsetu3
        $r zrange dest 0 10
    } {1 2 4 5 8}
+   
+   test {ZDIFF - with two zsets} {
+       $r zadd   
+   } {}
 
     test {EXPIRE - don't set timeouts multiple times} {
         $r set x foobar
