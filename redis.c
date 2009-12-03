@@ -4613,22 +4613,19 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
 
     // TODO: goto :exit if actualnum == 0
 
-    dictIterator **dictIterators = zmalloc(sizeof(dictIterator*)*actualnum);
-    dictEntry **dictEntries = zmalloc(sizeof(dictEntry*)*actualnum);
-
+    zskiplistNode **zskiplistNodes = zmalloc(sizeof(zskiplistNode*)*actualnum);
 
     for (j = 0; j < actualnum; j++) {
-        dictIterators[j] = dictGetIterator(zv[j]->dict);
-        dictEntries[j]  = dictNext(dictIterators[j]);
+        zskiplistNodes[j] = zv[j]->zsl->header->forward[0];
     }
 
     zsetobj = createZsetObject();
     int cardinality = 0;
 
-    double *score;
-    double *minscore = NULL;
+    double score, minscore;
     robj *ele;
     zset *zs = zsetobj->ptr;
+
 
     // no support for rev for now
     int toSkip = start;
@@ -4638,30 +4635,29 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
     redisLog(REDIS_DEBUG, "start: %d end: %d togo: %d", start, end, togo);
 
     while(togo) {
-
         for(j = 0; j < actualnum; j++) {
-            score = dictGetEntryVal(dictEntries[j]);
-            if(minscore == NULL || *minscore > *score) {
+            score = zskiplistNodes[j]->score;
+            if(j == 0|| minscore > score) {
                 minscore = score;
                 minIndex = j;
             }
         }
 
-        ele = dictGetEntryKey(dictEntries[minIndex]);
-        score = dictGetEntryVal(dictEntries[minIndex]);
+        ele = zskiplistNodes[j]->obj;
+        score = zskiplistNodes[j]->score;
 
-        redisLog(REDIS_DEBUG, "minscore: %d", *minscore);
+        redisLog(REDIS_DEBUG, "minscore: %f", minscore);
         redisLog(REDIS_DEBUG, "minindex: %d", minIndex);
-        redisLog(REDIS_DEBUG, "score: %f", *score);
+        redisLog(REDIS_DEBUG, "score: %f", score);
 
-        if (dictAdd(zs->dict,ele,score) == DICT_OK) {
+        if (dictAdd(zs->dict,ele,&score) == DICT_OK) {
             redisLog(REDIS_DEBUG, "dict ok, togo: %d", togo);
             incrRefCount(ele); /* added to hash */
-            zslInsert(zs->zsl,*score,ele);
+            zslInsert(zs->zsl,score,ele);
             incrRefCount(ele); /* added to skiplist */
             server.dirty++;
             cardinality++;
-            dictEntries[minIndex] = dictNext(dictIterators[minIndex]);
+            zskiplistNodes[j] = zskiplistNodes[j]->forward[0];
             togo--;
         } else { // this score already exist in set - skip it
             redisLog(REDIS_DEBUG, "dict not ok, togo: %d", togo);
@@ -4689,8 +4685,7 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
 
    // label :exit
    zfree(zv);
-   zfree(dictIterators);
-   zfree(dictEntries);
+   zfree(zskiplistNodes);
 }
 
 static void zrangeunionCommand(redisClient *c) {
