@@ -474,7 +474,7 @@ static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
 static void zrangeunionCommand(redisClient *c);
-static void zrangeunionfGenericCommand(redisClient *c, int reverse);
+static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, int setsnum, int reverse);
 static void zunionstoreCommand(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
 
@@ -4589,17 +4589,11 @@ static void zscoreCommand(redisClient *c) {
     }
 }
 
-static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
-    int start = atoi(c->argv[1]->ptr);
-    int end = atoi(c->argv[2]->ptr);
-    robj **setskeys = c->argv+3;
-    int setsnum = c->argc-3;
 
+static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, int setsnum, int reverse) {
     zset **zv = zmalloc(sizeof(zset*)*setsnum);
-    double *score;
-    int j, cardinality = 0;
-    dictIterator *di;
-    dictEntry *de;
+    
+    int j, actualnum = 0;
     robj *zsetobj;
 
     for (j = 0; j < setsnum; j++) {
@@ -4614,11 +4608,58 @@ static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
             return;
         }
         zv[j] = zsetobj->ptr;
+        actualnum++;
     }
-    
+
+    dictIterator **dictIterators = zmalloc(sizeof(dictIterator*)*actualnum);
+    dictEntry **dictEntries = zmalloc(sizeof(dictEntry*)*actualnum);
+
+
+    for (j = 0; j < actualnum; j++) {
+        dictIterators[j] = dictGetIterator(zv[j]->dict);
+        dictEntries[j]  = dictNext(dictIterators[j]);
+    }
+
     zsetobj = createZsetObject();
-    zset* zs = zsetobj->ptr;
-    robj* ele;
+    int cardinality = 0;
+
+    double *score;
+    double *minscore
+    robj *ele;
+    zset *zs = zsetobj->ptr;
+
+    // no support for rev for now
+    int toSkip = start;
+    int togo = end - start;
+    int minIndex;
+
+
+    while(togo) {
+        for(j = 0; actualnum; j++) {
+            score = dictGetEntryVal(dictEntries[j]);
+            if(minscore == NULL || minscore > score) {
+                minscore = score;
+                minIndex = j;
+            }
+        }
+
+        ele = dictGetEntryKey(dictEntries[minIndex]);
+        score = dictGetEntryVal(dictEntries[minIndex]);
+        
+        if (dictAdd(zs->dict,ele,score) == DICT_OK) {
+            incrRefCount(ele); /* added to hash */
+            zslInsert(zs->zsl,*score,ele);
+            incrRefCount(ele); /* added to skiplist */
+            server.dirty++;
+            cardinality++;
+            togo--;
+        } else { // this score already exist in set - skip it
+            continue;
+        }
+        
+
+
+    }
 
     for (j = 0; j < setsnum; j++) {
         if(!zv[j]) continue;
@@ -4691,11 +4732,11 @@ static void zrangeunionfGenericCommand(redisClient *c, int reverse) {
 }
 
 static void zrangeunionCommand(redisClient *c) {
-    zrangeunionfGenericCommand(c, 0);
+    zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 0);
 }
 
 static void zrevrangeUnionCommand(redisClient *c) {
-    zrangeunionfGenericCommand(c, 1);
+    zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 0);
 }
 
 static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey) {
