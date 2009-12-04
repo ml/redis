@@ -474,7 +474,8 @@ static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
 static void zrangeunionCommand(redisClient *c);
-static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, int setsnum, int reverse);
+static void zrevrangeUnionCommand(redisClient *c);
+static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, unsigned int setsnum, int reverse);
 static void zunionstoreCommand(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
 
@@ -526,6 +527,7 @@ static struct redisCommand cmdTable[] = {
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"zrevrangeunion",zrevrangeUnionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"zunionstore", zunionstoreCommand, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
@@ -4590,10 +4592,12 @@ static void zscoreCommand(redisClient *c) {
 }
 
 
-static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, int setsnum, int reverse) {
+static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj **setskeys, unsigned int setsnum, int reverse) {
+    REDIS_NOTUSED(reverse);
+    
     zset **zv = zmalloc(sizeof(zset*)*setsnum);
     
-    int j, actualnum = 0;
+    unsigned int  j, actualnum = 0;
     robj *zsetobj;
 
     for (j = 0; j < setsnum; j++) {
@@ -4629,38 +4633,39 @@ static void zrangeunionfGenericCommand(redisClient *c, int start, int end, robj 
 
     // no support for rev for now
     int toSkip = start;
+    REDIS_NOTUSED(toSkip);
     int togo = end - start;
-    int minIndex = 0;
+    int minIndex;
 
     redisLog(REDIS_DEBUG, "start: %d end: %d togo: %d", start, end, togo);
 
     while(togo) {
+        minIndex = 0;
+
         for(j = 0; j < actualnum; j++) {
             score = zskiplistNodes[j]->score;
-            if(j == 0|| minscore > score) {
+            if(j == 0 || minscore > score) {
                 minscore = score;
                 minIndex = j;
             }
         }
 
-        ele = zskiplistNodes[j]->obj;
-        score = zskiplistNodes[j]->score;
+        ele = zskiplistNodes[minIndex]->obj;
+        score = zskiplistNodes[minIndex]->score;
 
-        redisLog(REDIS_DEBUG, "minscore: %f", minscore);
-        redisLog(REDIS_DEBUG, "minindex: %d", minIndex);
         redisLog(REDIS_DEBUG, "score: %f", score);
+        redisLog(REDIS_DEBUG, "ele: %s", ele->ptr);
 
-        if (dictAdd(zs->dict,ele,&score) == DICT_OK) {
-            redisLog(REDIS_DEBUG, "dict ok, togo: %d", togo);
+        if (dictAdd(zs->dict,ele, &score) == DICT_OK) {
             incrRefCount(ele); /* added to hash */
             zslInsert(zs->zsl,score,ele);
             incrRefCount(ele); /* added to skiplist */
             server.dirty++;
             cardinality++;
-            zskiplistNodes[j] = zskiplistNodes[j]->forward[0];
+            zskiplistNodes[minIndex] = zskiplistNodes[minIndex]->forward[0];
             togo--;
         } else { // this score already exist in set - skip it
-            redisLog(REDIS_DEBUG, "dict not ok, togo: %d", togo);
+            //redisLog(REDIS_DEBUG, "dict not ok, togo: %d", togo);
             continue;
         }
     }
@@ -4693,7 +4698,7 @@ static void zrangeunionCommand(redisClient *c) {
 }
 
 static void zrevrangeUnionCommand(redisClient *c) {
-    //zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 1);
+    zrangeunionfGenericCommand(c, atoi(c->argv[1]->ptr), atoi(c->argv[2]->ptr), c->argv+3, c->argc-3, 1);
 }
 
 static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey) {
@@ -4727,11 +4732,11 @@ static void zunionstoreGenericCommand(redisClient *c, robj **setskeys, int setsn
 
         di = dictGetIterator(zv[j]->dict);
 
-        while (de = dictNext(di)) {
+        while ((de = dictNext(di))) {
             ele = dictGetEntryKey(de);
             score = dictGetEntryVal(de);
 
-            if (dictAdd(zs->dict, ele, score) == DICT_OK) {
+            if (dictAdd(zs->dict, ele, &score) == DICT_OK) {
                 incrRefCount(ele); /* added to hash */
                 zslInsert(zs->zsl, *score, ele);
                 incrRefCount(ele); /* added to skiplist */
