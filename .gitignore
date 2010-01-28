@@ -1,5 +1,4 @@
 00-RELEASENOTES
-.gitignore
 *.o
 *.rdb
 *.log
@@ -11,7 +10,3 @@ mkrelease.sh
 release
 myredis.conf
 misc/*
-.dep.inc
-Makefile-redis.mk
-nbproject/
-
