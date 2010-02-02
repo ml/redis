@@ -58,9 +58,9 @@ proc main {server port} {
     # <PASSWORD> is set in redis.conf and redis-server was started with
     # redis.conf as the first argument.  
 
-    #test {AUTH with requirepass in redis.conf} {
-    #    $r auth foobared
-    #} {OK}
+    test {AUTH with requirepass in redis.conf} {
+        $r auth foobared
+    } {OK}
 
     test {DEL all keys to start with a clean DB} {
         foreach key [$r keys *] {$r del $key}
@@ -961,9 +961,63 @@ proc main {server port} {
         set _ $err
     } {}
 
-    test {ZRANGE and ZREVRANGE} {
-        list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1]
-    } {{y x z} {z x y}}
+     test {ZRANGE and ZREVRANGE} {
+         list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1]
+     } {{y x z} {z x y}}
+
+    test {zrangeunionON} {
+        $r zadd zfoo 1 1
+        $r zadd zfoo 2 2
+        $r zadd zfoo 5 5
+
+        $r zadd bar 3 3
+        $r zadd bar 1 1
+        $r zadd bar 4 4
+
+        $r zadd baz 1 1
+        $r zadd baz 3 3
+        $r zadd baz 5 5
+        $r zadd baz 8 8
+        $r zrangeunion 1 5 zfoo bar baz
+    } {2 3 4 5}
+
+    test {ZRANGEUNION with range bigger than data set} {
+        $r zrangeunion 0 20 zfoo bar baz
+    } {1 2 3 4 5 8}
+
+    test {ZREVRANGEUNION} {
+        $r zrevrangeunion 2 5 zfoo bar baz
+    } {4 3 2}
+
+    test {ZREVRANGEUNION with range bigger than data set} {
+        $r zrevrangeunion 0 50 zfoo bar baz
+    } {8 5 4 3 2 1}
+
+    test {ZUNIONSTORE} {
+        $r zunionstore union zfoo bar baz
+        $r zrange union 0 50
+    } {1 2 3 4 5 8}
+
+    test {ZDIFFRANGE} {
+        $r zadd diff 4 4
+        $r zadd diff 1 1
+        $r zadd diff 6 6
+        $r zadd diff 3 3
+        $r zadd diff 7 7
+
+        $r zdiffrange 0 50 diff zfoo bar baz
+    } {6 7}
+
+    test {ZDIFFREVRANGE with only two keys} {
+        $r zdiffrevrange 0 4 diff zfoo
+    } {7 6 4 3}
+
+    test {ZINTERSTORE} {
+        $r zadd  forinter 1 1
+        $r zadd  forinter 5 5
+        $r zinterstore inter zfoo baz forinter
+        $r zrange inter 0 10
+    } {1 5}
 
     test {ZSETs stress tester - sorting is working well?} {
         set delta 0
