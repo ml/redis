@@ -8,9 +8,12 @@ source redis.tcl
 
 set ::passed 0
 set ::failed 0
+set ::testnum 0
 
 proc test {name code okpattern} {
-    puts -nonewline [format "%-70s " $name]
+    incr ::testnum
+    if {$::testnum < $::first || $::testnum > $::last} return
+    puts -nonewline [format "%-70s " "#$::testnum $name"]
     flush stdout
     set retval [uplevel 1 $code]
     if {$okpattern eq $retval || [string match $okpattern $retval]} {
@@ -49,10 +52,172 @@ proc zlistAlikeSort {a b} {
     string compare [lindex $a 1] [lindex $b 1]
 }
 
+proc waitForBgsave r {
+    while 1 {
+        set i [$r info]
+        if {[string match {*bgsave_in_progress:1*} $i]} {
+            puts -nonewline "\nWaiting for background save to finish... "
+            flush stdout
+            after 1000
+        } else {
+            break
+        }
+    }
+}
+
+proc waitForBgrewriteaof r {
+    while 1 {
+        set i [$r info]
+        if {[string match {*bgrewriteaof_in_progress:1*} $i]} {
+            puts -nonewline "\nWaiting for background AOF rewrite to finish... "
+            flush stdout
+            after 1000
+        } else {
+            break
+        }
+    }
+}
+
+proc randomInt {max} {
+    expr {int(rand()*$max)}
+}
+
+proc randpath args {
+    set path [expr {int(rand()*[llength $args])}]
+    uplevel 1 [lindex $args $path]
+}
+
+proc randomValue {} {
+    randpath {
+        # Small enough to likely collide
+        randomInt 1000
+    } {
+        # 32 bit compressible signed/unsigned
+        randpath {randomInt 2000000000} {randomInt 4000000000}
+    } {
+        # 64 bit
+        randpath {randomInt 1000000000000}
+    } {
+        # Random string
+        randpath {randstring 0 256 alpha} \
+                {randstring 0 256 compr} \
+                {randstring 0 256 binary}
+    }
+}
+
+proc randomKey {} {
+    randpath {
+        # Small enough to likely collide
+        randomInt 1000
+    } {
+        # 32 bit compressible signed/unsigned
+        randpath {randomInt 2000000000} {randomInt 4000000000}
+    } {
+        # 64 bit
+        randpath {randomInt 1000000000000}
+    } {
+        # Random string
+        randpath {randstring 1 256 alpha} \
+                {randstring 1 256 compr}
+    }
+}
+
+proc createComplexDataset {r ops} {
+    for {set j 0} {$j < $ops} {incr j} {
+        set k [randomKey]
+        set v [randomValue]
+        randpath {
+            set d [expr {rand()}]
+        } {
+            set d [expr {rand()}]
+        } {
+            set d [expr {rand()}]
+        } {
+            set d [expr {rand()}]
+        } {
+            set d [expr {rand()}]
+        } {
+            randpath {set d +inf} {set d -inf}
+        }
+        set t [$r type $k]
+
+        if {$t eq {none}} {
+            randpath {
+                $r set $k $v
+            } {
+                $r lpush $k $v
+            } {
+                $r sadd $k $v
+            } {
+                $r zadd $k $d $v
+            }
+            set t [$r type $k]
+        }
+
+        switch $t {
+            {string} {
+                # Nothing to do
+            }
+            {list} {
+                randpath {$r lpush $k $v} \
+                        {$r rpush $k $v} \
+                        {$r lrem $k 0 $v} \
+                        {$r rpop $k} \
+                        {$r lpop $k}
+            }
+            {set} {
+                randpath {$r sadd $k $v} \
+                        {$r srem $k $v}
+            }
+            {zset} {
+                randpath {$r zadd $k $d $v} \
+                        {$r zrem $k $v}
+            }
+        }
+    }
+}
+
+proc datasetDigest r {
+    set keys [lsort [split [$r keys *] " "]]
+    set digest {}
+    foreach k $keys {
+        set t [$r type $k]
+        switch $t {
+            {string} {
+                set aux [::sha1::sha1 -hex [$r get $k]]
+            } {list} {
+                if {[$r llen $k] == 0} {
+                    set aux {}
+                } else {
+                    set aux [::sha1::sha1 -hex [$r lrange $k 0 -1]]
+                }
+            } {set} {
+                if {[$r scard $k] == 0} {
+                    set aux {}
+                } else {
+                    set aux [::sha1::sha1 -hex [lsort [$r smembers $k]]]
+                }
+            } {zset} {
+                if {[$r zcard $k] == 0} {
+                    set aux {}
+                } else {
+                    set aux [::sha1::sha1 -hex [$r zrange $k 0 -1]]
+                }
+            } default {
+                error "Type not supported"
+            }
+        }
+        if {$aux eq {}} continue
+        set digest [::sha1::sha1 -hex [join [list $aux $digest $k] "\n"]]
+    }
+    return $digest
+}
+
 proc main {server port} {
     set r [redis $server $port]
     $r select 9
     set err ""
+    set res ""
 
     # The following AUTH test should be enabled only when requirepass
     # <PASSWORD> is set in redis.conf and redis-server was started with
@@ -71,6 +236,11 @@ proc main {server port} {
         $r set x foobar
         $r get x
     } {foobar}
+
+    test {SET and GET an empty item} {
+        $r set x {}
+        $r get x
+    } {}
 
     test {DEL against a single item} {
         $r del x
@@ -150,6 +320,11 @@ proc main {server port} {
         $r incrby novar 17179869184
     } {34359738368}
 
+    test {INCR against key with spaces (no integer encoded)} {
+        $r set novar "    11    "
+        $r incr novar
+    } {12}
+
     test {DECRBY over 32bit value with over 32bit increment, negative res} {
         $r set novar 17179869184
         $r decrby novar 17179869185
@@ -212,7 +387,8 @@ proc main {server port} {
         append res [$r lindex mylist 0]
         append res [$r lindex mylist 1]
         append res [$r lindex mylist 2]
-    } {3bac}
+        list $res [$r lindex mylist 100]
+    } {3bac {}}
 
     test {DEL a list} {
         $r del mylist
@@ -265,10 +441,18 @@ proc main {server port} {
         format $err
     } {ERR*}
 
+    test {LLEN against non existing key} {
+        $r llen not-a-key
+    } {0}
+
     test {LINDEX against non-list value error} {
         catch {$r lindex mylist 0} err
         format $err
     } {ERR*}
+
+    test {LINDEX against non existing key} {
+        $r lindex not-a-key 10
+    } {}
 
     test {LPUSH against non-list value error} {
         catch {$r lpush mylist 0} err
@@ -345,6 +529,12 @@ proc main {server port} {
         catch {$r rpoplpush mylist newlist} err
         list [$r lrange mylist 0 -1] [$r type newlist] [string range $err 0 2]
     } {{a b c d} string ERR}
+
+    test {RPOPLPUSH against non existing src key} {
+        $r del mylist
+        $r del newlist
+        $r rpoplpush mylist newlist
+    } {}
 
     test {RENAME basic usage} {
         $r set mykey hello
@@ -509,7 +699,36 @@ proc main {server port} {
         $r lrange mylist 0 -1
     } {99 98 97 96 95}
 
+    test {LTRIM stress testing} {
+        set mylist {}
+        set err {}
+        for {set i 0} {$i < 20} {incr i} {
+            lappend mylist $i
+        }
+
+        for {set j 0} {$j < 100} {incr j} {
+            # Fill the list
+            $r del mylist
+            for {set i 0} {$i < 20} {incr i} {
+                $r rpush mylist $i
+            }
+            # Trim at random
+            set a [randomInt 20]
+            set b [randomInt 20]
+            $r ltrim mylist $a $b
+            if {[$r lrange mylist 0 -1] ne [lrange $mylist $a $b]} {
+                set err "[$r lrange mylist 0 -1] != [lrange $mylist $a $b]"
+                break
+            }
+        }
+        set _ $err
+    } {}
+
     test {LSET} {
+        $r del mylist
+        foreach x {99 98 97 96 95} {
+            $r rpush mylist $x
+        }
         $r lset mylist 1 foo
         $r lset mylist -1 bar
         $r lrange mylist 0 -1
@@ -585,6 +804,11 @@ proc main {server port} {
         lsort [$r smembers setres]
     } [lsort -uniq "[$r smembers set1] [$r smembers set2]"]
 
+    test {SUNIONSTORE against non existing keys} {
+        $r set setres xxx
+        list [$r sunionstore setres foo111 bar222] [$r exists xxx]
+    } {0 0}
+
     test {SINTER against three sets} {
         $r sadd set3 999
         $r sadd set3 995
@@ -629,16 +853,7 @@ proc main {server port} {
 
     test {SAVE - make sure there are all the types as values} {
         # Wait for a background saving in progress to terminate
-        while 1 {
-            set i [$r info]
-            if {[string match {*bgsave_in_progress:1*} $i]} {
-                puts -nonewline "\nWaiting for background save to finish... "
-                flush stdout
-                after 100
-            } else {
-                break
-            }
-        }
+        waitForBgsave $r
         $r lpush mysavelist hello
         $r lpush mysavelist world
         $r set myemptykey {}
@@ -662,18 +877,23 @@ proc main {server port} {
         lsort [array names myset]
     } {a b c}
     
-    test {Create a random list} {
+    test {Create a random list and a random set} {
         set tosort {}
         array set seenrand {}
         for {set i 0} {$i < 10000} {incr i} {
             while 1 {
                 # Make sure all the weights are different because
                 # Redis does not use a stable sort but Tcl does.
-                set rint [expr int(rand()*1000000)]
+                randpath {
+                    set rint [expr int(rand()*1000000)]
+                } {
+                    set rint [expr rand()]
+                }
                 if {![info exists seenrand($rint)]} break
             }
             set seenrand($rint) x
             $r lpush tosort $i
+            $r sadd tosort-set $i
             $r set weight_$i $rint
             lappend tosort [list $i $rint]
         }
@@ -687,6 +907,15 @@ proc main {server port} {
 
     test {SORT with BY against the newly created list} {
         $r sort tosort {BY weight_*}
+    } $res
+
+    test {the same SORT with BY, but against the newly created set} {
+        $r sort tosort-set {BY weight_*}
+    } $res
+
+    test {SORT with BY and STORE against the newly created list} {
+        $r sort tosort {BY weight_*} store sort-res
+        $r lrange sort-res 0 -1
     } $res
 
     test {SORT direct, numeric, against the newly created list} {
@@ -746,6 +975,10 @@ proc main {server port} {
         $r mset weight_1 10 weight_2 5 weight_3 30
         $r sort mylist BY weight_* GET #
     } {2 1 3}
+
+    test {SORT with constant GET} {
+        $r sort mylist GET foo
+    } {{} {} {}}
 
     test {LREM, remove all the occurrences} {
         $r flushdb
@@ -925,6 +1158,14 @@ proc main {server port} {
         list $aux1 $aux2
     } {{x y z} {y x z}}
 
+    test {ZCARD basics} {
+        $r zcard ztmp
+    } {3}
+
+    test {ZCARD non existing key} {
+        $r zcard ztmp-blabla
+    } {0}
+
     test {ZSCORE} {
         set aux {}
         set err {}
@@ -961,9 +1202,9 @@ proc main {server port} {
         set _ $err
     } {}
 
-     test {ZRANGE and ZREVRANGE} {
-         list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1]
-     } {{y x z} {z x y}}
+    test {ZRANGE and ZREVRANGE} {
+        list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1]
+    } {{y x z} {z x y}}
 
     test {zrangeunionON} {
         $r zadd zfoo 1 1
@@ -1018,6 +1259,14 @@ proc main {server port} {
         $r zinterstore inter zfoo baz forinter
         $r zrange inter 0 10
     } {1 5}
+    test {ZRANGE and ZREVRANGE basics} {
+        list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1] \
+            [$r zrange ztmp 1 -1] [$r zrevrange ztmp 1 -1]
+    } {{y x z} {z x y} {x z} {x y}}
+
+    test {ZRANGE WITHSCORES} {
+        $r zrange ztmp 0 -1 withscores
+    } {y 1 x 10 z 30}
 
     test {ZSETs stress tester - sorting is working well?} {
         set delta 0
@@ -1252,6 +1501,124 @@ proc main {server port} {
         } {0}
     }
 
+    test {BGSAVE} {
+        $r flushdb
+        $r save
+        $r set x 10
+        $r bgsave
+        waitForBgsave $r
+        $r debug reload
+        $r get x
+    } {10}
+
+    test {Handle an empty query well} {
+        set fd [$r channel]
+        puts -nonewline $fd "\r\n"
+        flush $fd
+        $r ping
+    } {PONG}
+
+    test {Negative multi bulk command does not create problems} {
+        set fd [$r channel]
+        puts -nonewline $fd "*-10\r\n"
+        flush $fd
+        $r ping
+    } {PONG}
+
+    test {Negative multi bulk payload} {
+        set fd [$r channel]
+        puts -nonewline $fd "SET x -10\r\n"
+        flush $fd
+        gets $fd
+    } {*invalid bulk*}
+
+    test {Too big bulk payload} {
+        set fd [$r channel]
+        puts -nonewline $fd "SET x 2000000000\r\n"
+        flush $fd
+        gets $fd
+    } {*invalid bulk*count*}
+
+    test {Multi bulk request not followed by bulk args} {
+        set fd [$r channel]
+        puts -nonewline $fd "*1\r\nfoo\r\n"
+        flush $fd
+        gets $fd
+    } {*protocol error*}
+
+    test {Generic wrong number of args} {
+        catch {$r ping x y z} err
+        set _ $err
+    } {*wrong*arguments*ping*}
+
+    test {SELECT an out of range DB} {
+        catch {$r select 1000000} err
+        set _ $err
+    } {*invalid*}
+
+    if {![catch {package require sha1}]} {
+        test {Check consistency of different data types after a reload} {
+            $r flushdb
+            createComplexDataset $r 10000
+            set sha1 [datasetDigest $r]
+            $r debug reload
+            set sha1_after [datasetDigest $r]
+            expr {$sha1 eq $sha1_after}
+        } {1}
+
+        test {Same dataset digest if saving/reloading as AOF?} {
+            $r bgrewriteaof
+            waitForBgrewriteaof $r
+            $r debug loadaof
+            set sha1_after [datasetDigest $r]
+            expr {$sha1 eq $sha1_after}
+        } {1}
+    }
+
+    test {EXPIRES after a reload (snapshot + append only file)} {
+        $r flushdb
+        $r set x 10
+        $r expire x 1000
+        $r save
+        $r debug reload
+        set ttl [$r ttl x]
+        set e1 [expr {$ttl > 900 && $ttl <= 1000}]
+        $r bgrewriteaof
+        waitForBgrewriteaof $r
+        set ttl [$r ttl x]
+        set e2 [expr {$ttl > 900 && $ttl <= 1000}]
+        list $e1 $e2
+    } {1 1}
+
+    test {PIPELINING stresser (also a regression for the old epoll bug)} {
+        set fd2 [socket 127.0.0.1 6379]
+        fconfigure $fd2 -encoding binary -translation binary
+        puts -nonewline $fd2 "SELECT 9\r\n"
+        flush $fd2
+        gets $fd2
+
+        for {set i 0} {$i < 100000} {incr i} {
+            set q {}
+            set val "0000${i}0000"
+            append q "SET key:$i [string length $val]\r\n$val\r\n"
+            puts -nonewline $fd2 $q
+            set q {}
+            append q "GET key:$i\r\n"
+            puts -nonewline $fd2 $q
+        }
+        flush $fd2
+
+        for {set i 0} {$i < 100000} {incr i} {
+            gets $fd2 line
+            gets $fd2 count
+            set count [string range $count 1 end]
+            set val [read $fd2 $count]
+            read $fd2 2
+        }
+        close $fd2
+        set _ 1
+    } {1}
+
     # Leave the user with a clean DB before to exit
     test {FLUSHDB} {
         set aux {}
@@ -1279,7 +1646,6 @@ proc main {server port} {
     if {$::failed > 0} {
         puts "\n*** WARNING!!! $::failed FAILED TESTS ***\n"
     }
-    close $fd
 }
 
 proc stress {} {
@@ -1316,8 +1682,48 @@ proc stress {} {
     $r close
 }
 
+# Set a few configuration defaults
+set ::host 127.0.0.1
+set ::port 6379
+set ::stress 0
+set ::flush 0
+set ::first 0
+set ::last 1000000
+
+# Parse arguments
+for {set j 0} {$j < [llength $argv]} {incr j} {
+    set opt [lindex $argv $j]
+    set arg [lindex $argv [expr $j+1]]
+    set lastarg [expr {$arg eq {}}]
+    if {$opt eq {-h} && !$lastarg} {
+        set ::host $arg
+        incr j
+    } elseif {$opt eq {-p} && !$lastarg} {
+        set ::port $arg
+        incr j
+    } elseif {$opt eq {-stress}} {
+        set ::stress 1
+    } elseif {$opt eq {--flush}} {
+        set ::flush 1
+    } elseif {$opt eq {--first} && !$lastarg} {
+        set ::first $arg
+        incr j
+    } elseif {$opt eq {--last} && !$lastarg} {
+        set ::last $arg
+        incr j
+    } else {
+        puts "Wrong argument: $opt"
+        exit 1
+    }
+}
+
 # Before to run the test check if DB 9 and DB 10 are empty
 set r [redis]
+
+if {$::flush} {
+    $r flushall
+}
+
 $r select 9
 set db9size [$r dbsize]
 $r select 10
@@ -1331,10 +1737,8 @@ unset r
 unset db9size
 unset db10size
 
-if {[llength $argv] == 0} {
-    main 127.0.0.1 6379
-} elseif {[llength $argv] == 1 && [lindex $argv 0] eq {stress}} {
+if {$::stress} {
     stress
 } else {
-    main [lindex $argv 0] [lindex $argv 1]
+    main $::host $::port
 }

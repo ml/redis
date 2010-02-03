@@ -140,7 +140,7 @@ sds sdscpylen(sds s, char *t, size_t len) {
     size_t totlen = sh->free+sh->len;
 
     if (totlen < len) {
-        s = sdsMakeRoomFor(s,len-totlen);
+        s = sdsMakeRoomFor(s,len-sh->len);
         if (s == NULL) return NULL;
         sh = (void*) (s-(sizeof(struct sdshdr)));
         totlen = sh->free+sh->len;
@@ -277,6 +277,10 @@ sds *sdssplitlen(char *s, int len, char *sep, int seplen, int *count) {
     if (tokens == NULL) sdsOomAbort();
 #endif
     if (seplen < 1 || len < 0 || tokens == NULL) return NULL;
+    if (len == 0) {
+        *count = 0;
+        return tokens;
+    }
     for (j = 0; j < (len-(seplen-1)); j++) {
         /* make sure there is room for the next element and the final one */
         if (slots < elements+2) {

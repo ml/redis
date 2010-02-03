@@ -27,7 +27,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#define REDIS_VERSION "1.1.91"
+#define REDIS_VERSION "1.1.95"
 
 #include "fmacros.h"
 #include "config.h"
@@ -157,6 +157,7 @@
 #define REDIS_SLAVE 2       /* This client is a slave server */
 #define REDIS_MASTER 4      /* This client is a master server */
 #define REDIS_MONITOR 8      /* This client is a slave monitor, see MONITOR */
+#define REDIS_MULTI 16      /* This client is in a MULTI context */
 
 /* Slave replication state - slave side */
 #define REDIS_REPL_NONE 0   /* No active replication */
@@ -230,6 +231,18 @@ typedef struct redisDb {
     int id;
 } redisDb;
 
+/* Client MULTI/EXEC state */
+typedef struct multiCmd {
+    robj **argv;
+    int argc;
+    struct redisCommand *cmd;
+} multiCmd;
+
+typedef struct multiState {
+    multiCmd *commands;     /* Array of MULTI commands */
+    int count;              /* Total number of MULTI commands */
+} multiState;
+
 /* With multiplexing we need to take per-clinet state.
  * Clients are taken in a liked list. */
 typedef struct redisClient {
@@ -245,12 +258,14 @@ typedef struct redisClient {
     int sentlen;
     time_t lastinteraction; /* time of the last interaction, used for timeout */
     int flags;              /* REDIS_CLOSE | REDIS_SLAVE | REDIS_MONITOR */
+                            /* REDIS_MULTI */
     int slaveseldb;         /* slave selected db, if this client is a slave */
     int authenticated;      /* when requirepass is non-NULL */
     int replstate;          /* replication state if this is a slave */
     int repldbfd;           /* replication DB file descriptor */
-    long repldboff;          /* replication DB file offset */
+    long repldboff;         /* replication DB file offset */
     off_t repldbsize;       /* replication DB file size */
+    multiState mstate;      /* MULTI/EXEC state */
 } redisClient;
 
 struct saveparam {
@@ -301,6 +316,7 @@ struct redisServer {
     char *appendfilename;
     char *requirepass;
     int shareobjects;
+    int rdbcompression;
     /* Replication related */
     int isslave;
     char *masterauth;
@@ -367,7 +383,7 @@ typedef struct zset {
 
 struct sharedObjectsStruct {
     robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
-    *colon, *nullbulk, *nullmultibulk,
+    *colon, *nullbulk, *nullmultibulk, *queued,
     *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
     *outofrangeerr, *plus,
     *select0, *select1, *select2, *select3, *select4,
@@ -419,6 +435,9 @@ static void zslFree(zskiplist *zsl);
 static void zslInsert(zskiplist *zsl, double score, robj *obj);
 static zskiplistNode *nodeSubsequent(zskiplistNode *node, int reversOrder);
 static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int mask);
+static void initClientMultiState(redisClient *c);
+static void freeClientMultiState(redisClient *c);
+static void queueMultiCommand(redisClient *c, struct redisCommand *cmd);
 
 
 static void authCommand(redisClient *c);
@@ -500,6 +519,8 @@ static void zdiffrangeCommand(redisClient *c);
 static void zdiffrevrangeCommand(redisClient *c);
 static void zinterstoreCommad(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
+static void multiCommand(redisClient *c);
+static void execCommand(redisClient *c);
 
 /*================================= Globals ================================= */
 
@@ -543,9 +564,9 @@ static struct redisCommand cmdTable[] = {
     {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"zrem",zremCommand,3,REDIS_CMD_BULK},
     {"zremrangebyscore",zremrangebyscoreCommand,4,REDIS_CMD_INLINE},
-    {"zrange",zrangeCommand,4,REDIS_CMD_INLINE},
+    {"zrange",zrangeCommand,-4,REDIS_CMD_INLINE},
     {"zrangebyscore",zrangebyscoreCommand,-4,REDIS_CMD_INLINE},
-    {"zrevrange",zrevrangeCommand,4,REDIS_CMD_INLINE},
+    {"zrevrange",zrevrangeCommand,-4,REDIS_CMD_INLINE},
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
@@ -577,6 +598,8 @@ static struct redisCommand cmdTable[] = {
     {"shutdown",shutdownCommand,1,REDIS_CMD_INLINE},
     {"lastsave",lastsaveCommand,1,REDIS_CMD_INLINE},
     {"type",typeCommand,2,REDIS_CMD_INLINE},
+    {"multi",multiCommand,1,REDIS_CMD_INLINE},
+    {"exec",execCommand,1,REDIS_CMD_INLINE},
     {"sync",syncCommand,1,REDIS_CMD_INLINE},
     {"flushdb",flushdbCommand,1,REDIS_CMD_INLINE},
     {"flushall",flushallCommand,1,REDIS_CMD_INLINE},
@@ -937,7 +960,7 @@ void backgroundRewriteDoneHandler(int statloc) {
             close(fd);
             goto cleanup;
         }
-        redisLog(REDIS_WARNING,"Parent diff flushed into the new append log file with success");
+        redisLog(REDIS_NOTICE,"Parent diff flushed into the new append log file with success (%lu bytes)",sdslen(server.bgrewritebuf));
         /* Now our work is to rename the temp file into the stable file. And
          * switch the file descriptor used by the server for append only. */
         if (rename(tmpfile,server.appendfilename) == -1) {
@@ -1095,8 +1118,8 @@ static void createSharedObjects(void) {
     shared.nullbulk = createObject(REDIS_STRING,sdsnew("$-1\r\n"));
     shared.nullmultibulk = createObject(REDIS_STRING,sdsnew("*-1\r\n"));
     shared.emptymultibulk = createObject(REDIS_STRING,sdsnew("*0\r\n"));
-    /* no such key */
     shared.pong = createObject(REDIS_STRING,sdsnew("+PONG\r\n"));
+    shared.queued = createObject(REDIS_STRING,sdsnew("+QUEUED\r\n"));
     shared.wrongtypeerr = createObject(REDIS_STRING,sdsnew(
         "-ERR Operation against a key holding the wrong kind of value\r\n"));
     shared.nokeyerr = createObject(REDIS_STRING,sdsnew(
@@ -1155,6 +1178,7 @@ static void initServerConfig() {
     server.appendfilename = "appendonly.aof";
     server.requirepass = NULL;
     server.shareobjects = 0;
+    server.rdbcompression = 1;
     server.sharingpoolsize = 1024;
     server.maxclients = 0;
     server.maxmemory = 0;
@@ -1355,6 +1379,10 @@ static void loadServerConfig(char *filename) {
             if ((server.shareobjects = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"rdbcompression") && argc == 2) {
+            if ((server.rdbcompression = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"shareobjectspoolsize") && argc == 2) {
             server.sharingpoolsize = atoi(argv[1]);
             if (server.sharingpoolsize < 1) {
@@ -1441,6 +1469,7 @@ static void freeClient(redisClient *c) {
     }
     zfree(c->argv);
     zfree(c->mbargv);
+    freeClientMultiState(c);
     zfree(c);
 }
 
@@ -1631,6 +1660,21 @@ static void resetClient(redisClient *c) {
     c->multibulk = 0;
 }
 
+/* Call() is the core of Redis execution of a command */
+static void call(redisClient *c, struct redisCommand *cmd) {
+    long long dirty;
+
+    dirty = server.dirty;
+    cmd->proc(c);
+    if (server.appendonly && server.dirty-dirty)
+        feedAppendOnlyFile(cmd,c->db->id,c->argv,c->argc);
+    if (server.dirty-dirty && listLength(server.slaves))
+        replicationFeedSlaves(server.slaves,cmd,c->db->id,c->argv,c->argc);
+    if (listLength(server.monitors))
+        replicationFeedSlaves(server.monitors,cmd,c->db->id,c->argv,c->argc);
+    server.stat_numcommands++;
+}
+
 /* If this function gets called we already read a whole
  * command, argments are in the client argv/argc fields.
  * processCommand() execute the command or prepare the
@@ -1641,7 +1685,6 @@ static void resetClient(redisClient *c) {
  * if 0 is returned the client was destroied (i.e. after QUIT). */
 static int processCommand(redisClient *c) {
     struct redisCommand *cmd;
-    long long dirty;
 
     /* Free some memory if needed (maxmemory setting) */
     if (server.maxmemory) freeMemoryIfNeeded();
@@ -1722,12 +1765,17 @@ static int processCommand(redisClient *c) {
     }
     cmd = lookupCommand(c->argv[0]->ptr);
     if (!cmd) {
-        addReplySds(c,sdsnew("-ERR unknown command\r\n"));
+        addReplySds(c,
+            sdscatprintf(sdsempty(), "-ERR unknown command '%s'\r\n",
+                (char*)c->argv[0]->ptr));
         resetClient(c);
         return 1;
     } else if ((cmd->arity > 0 && cmd->arity != c->argc) ||
                (c->argc < -cmd->arity)) {
-        addReplySds(c,sdsnew("-ERR wrong number of arguments\r\n"));
+        addReplySds(c,
+            sdscatprintf(sdsempty(),
+                "-ERR wrong number of arguments for '%s' command\r\n",
+                cmd->name));
         resetClient(c);
         return 1;
     } else if (server.maxmemory && cmd->flags & REDIS_CMD_DENYOOM && zmalloc_used_memory() > server.maxmemory) {
@@ -1777,15 +1825,12 @@ static int processCommand(redisClient *c) {
     }
 
     /* Exec the command */
-    dirty = server.dirty;
-    cmd->proc(c);
-    if (server.appendonly && server.dirty-dirty)
-        feedAppendOnlyFile(cmd,c->db->id,c->argv,c->argc);
-    if (server.dirty-dirty && listLength(server.slaves))
-        replicationFeedSlaves(server.slaves,cmd,c->db->id,c->argv,c->argc);
-    if (listLength(server.monitors))
-        replicationFeedSlaves(server.monitors,cmd,c->db->id,c->argv,c->argc);
-    server.stat_numcommands++;
+    if (c->flags & REDIS_MULTI && cmd->proc != execCommand) {
+        queueMultiCommand(c,cmd);
+        addReply(c,shared.queued);
+    } else {
+        call(c,cmd);
+    }
 
     /* Prepare the client for the next command */
     if (c->flags & REDIS_CLOSE) {
@@ -1888,11 +1933,6 @@ again:
             sdsupdatelen(query);
 
             /* Now we can split the query in arguments */
-            if (sdslen(query) == 0) {
-                /* Ignore empty query */
-                sdsfree(query);
-                return;
-            }
             argv = sdssplitlen(query,sdslen(query)," ",1,&argc);
             sdsfree(query);
 
@@ -1908,10 +1948,16 @@ again:
                 }
             }
             zfree(argv);
-            /* Execute the command. If the client is still valid
-             * after processCommand() return and there is something
-             * on the query buffer try to process the next command. */
-            if (c->argc && processCommand(c) && sdslen(c->querybuf)) goto again;
+            if (c->argc) {
+                /* Execute the command. If the client is still valid
+                 * after processCommand() return and there is something
+                 * on the query buffer try to process the next command. */
+                if (processCommand(c) && sdslen(c->querybuf)) goto again;
+            } else {
+                /* Nothing to process, argc == 0. Just process the query
+                 * buffer if it's not empty or return to the caller */
+                if (sdslen(c->querybuf)) goto again;
+            }
             return;
         } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
             redisLog(REDIS_DEBUG, "Client protocol error");
@@ -2010,6 +2056,7 @@ static redisClient *createClient(int fd) {
         return NULL;
     }
     listAddNodeTail(server.clients,c);
+    initClientMultiState(c);
     return c;
 }
 
@@ -2044,6 +2091,7 @@ static void addReplyBulkLen(redisClient *c, robj *obj) {
     } else {
         long n = (long)obj->ptr;
 
+        /* Compute how many bytes will take this integer as a radix 10 string */
         len = 1;
         if (n < 0) {
             len++;
@@ -2497,7 +2545,7 @@ static int rdbSaveStringObjectRaw(FILE *fp, robj *obj) {
 
     /* Try LZF compression - under 20 bytes it's unable to compress even
      * aaaaaaaaaaaaaaaaaa so skip it */
-    if (len > 20) {
+    if (server.rdbcompression && len > 20) {
         int retval;
 
         retval = rdbSaveLzfStringObject(fp,obj);
@@ -2993,7 +3041,7 @@ static void echoCommand(redisClient *c) {
 static void setGenericCommand(redisClient *c, int nx) {
     int retval;
 
-    deleteIfVolatile(c->db,c->argv[1]);
+    if (nx) deleteIfVolatile(c->db,c->argv[1]);
     retval = dictAdd(c->db->dict,c->argv[1],c->argv[2]);
     if (retval == DICT_ERR) {
         if (!nx) {
@@ -3020,24 +3068,31 @@ static void setnxCommand(redisClient *c) {
     setGenericCommand(c,1);
 }
 
-static void getCommand(redisClient *c) {
+static int getGenericCommand(redisClient *c) {
     robj *o = lookupKeyRead(c->db,c->argv[1]);
 
     if (o == NULL) {
         addReply(c,shared.nullbulk);
+        return REDIS_OK;
     } else {
         if (o->type != REDIS_STRING) {
             addReply(c,shared.wrongtypeerr);
+            return REDIS_ERR;
         } else {
             addReplyBulkLen(c,o);
             addReply(c,o);
             addReply(c,shared.crlf);
+            return REDIS_OK;
         }
     }
 }
 
+static void getCommand(redisClient *c) {
+    getGenericCommand(c);
+}
+
 static void getsetCommand(redisClient *c) {
-    getCommand(c);
+    if (getGenericCommand(c) == REDIS_ERR) return;
     if (dictAdd(c->db->dict,c->argv[1],c->argv[2]) == DICT_ERR) {
         dictReplace(c->db->dict,c->argv[1],c->argv[2]);
     } else {
@@ -3072,7 +3127,7 @@ static void msetGenericCommand(redisClient *c, int nx) {
     int j, busykeys = 0;
 
     if ((c->argc % 2) == 0) {
-        addReplySds(c,sdsnew("-ERR wrong number of arguments\r\n"));
+        addReplySds(c,sdsnew("-ERR wrong number of arguments for MSET\r\n"));
         return;
     }
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
@@ -3306,7 +3361,8 @@ static void bgsaveCommand(redisClient *c) {
         return;
     }
     if (rdbSaveBackground(server.dbfilename) == REDIS_OK) {
-        addReply(c,shared.ok);
+        char *status = "+Background saving started\r\n";
+        addReplySds(c,sdsnew(status));
     } else {
         addReply(c,shared.err);
     }
@@ -3322,20 +3378,26 @@ static void shutdownCommand(redisClient *c) {
         kill(server.bgsavechildpid,SIGKILL);
         rdbRemoveTempFile(server.bgsavechildpid);
     }
-    /* SYNC SAVE */
-    if (rdbSave(server.dbfilename) == REDIS_OK) {
-        if (server.daemonize)
-            unlink(server.pidfile);
-        redisLog(REDIS_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
-        redisLog(REDIS_WARNING,"Server exit now, bye bye...");
-        exit(1);
+    if (server.appendonly) {
+        /* Append only file: fsync() the AOF and exit */
+        fsync(server.appendfd);
+        exit(0);
     } else {
-        /* Ooops.. error saving! The best we can do is to continue operating.
-         * Note that if there was a background saving process, in the next
-         * cron() Redis will be notified that the background saving aborted,
-         * handling special stuff like slaves pending for synchronization... */
-        redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit"); 
-        addReplySds(c,sdsnew("-ERR can't quit, problems saving the DB\r\n"));
+        /* Snapshotting. Perform a SYNC SAVE and exit */
+        if (rdbSave(server.dbfilename) == REDIS_OK) {
+            if (server.daemonize)
+                unlink(server.pidfile);
+            redisLog(REDIS_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
+            redisLog(REDIS_WARNING,"Server exit now, bye bye...");
+            exit(0);
+        } else {
+            /* Ooops.. error saving! The best we can do is to continue operating.
+             * Note that if there was a background saving process, in the next
+             * cron() Redis will be notified that the background saving aborted,
+             * handling special stuff like slaves pending for synchronization... */
+            redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit"); 
+            addReplySds(c,sdsnew("-ERR can't quit, problems saving the DB\r\n"));
+        }
     }
 }
 
@@ -3633,7 +3695,7 @@ static void ltrimCommand(redisClient *c) {
     
     o = lookupKeyWrite(c->db,c->argv[1]);
     if (o == NULL) {
-        addReply(c,shared.nokeyerr);
+        addReply(c,shared.ok);
     } else {
         if (o->type != REDIS_LIST) {
             addReply(c,shared.wrongtypeerr);
@@ -3970,8 +4032,9 @@ static void sinterGenericCommand(redisClient *c, robj **setskeys, unsigned long 
         if (!setobj) {
             zfree(dv);
             if (dstkey) {
-                deleteKey(c->db,dstkey);
-                addReply(c,shared.ok);
+                if (deleteKey(c->db,dstkey))
+                    server.dirty++;
+                addReply(c,shared.czero);
             } else {
                 addReply(c,shared.nullmultibulk);
             }
@@ -4531,6 +4594,14 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
     robj *o;
     int start = atoi(c->argv[2]->ptr);
     int end = atoi(c->argv[3]->ptr);
+    int withscores = 0;
+
+    if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
+        withscores = 1;
+    } else if (c->argc >= 5) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
 
     o = lookupKeyRead(c->db,c->argv[1]);
     if (o == NULL) {
@@ -4573,13 +4644,16 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
                     ln = ln->forward[0];
             }
 
-            addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",rangelen));
+            addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",
+                withscores ? (rangelen*2) : rangelen));
 
             for (j = 0; j < rangelen; j++) {
                 ele = ln->obj;
                 addReplyBulkLen(c,ele);
                 addReply(c,ele);
                 addReply(c,shared.crlf);
+                if (withscores)
+                    addReplyDouble(c,ln->score);
                 ln = reverse ? ln->backward : ln->forward[0];
             }
         }
@@ -4601,7 +4675,8 @@ static void zrangebyscoreCommand(redisClient *c) {
     int offset = 0, limit = -1;
 
     if (c->argc != 4 && c->argc != 7) {
-        addReplySds(c,sdsnew("-ERR wrong number of arguments\r\n"));
+        addReplySds(c,
+            sdsnew("-ERR wrong number of arguments for ZRANGEBYSCORE\r\n"));
         return;
     } else if (c->argc == 7 && strcasecmp(c->argv[4]->ptr,"limit")) {
         addReply(c,shared.syntaxerr);
@@ -5082,7 +5157,7 @@ static void sortCommand(redisClient *c) {
     /* Lookup the key to sort. It must be of the right types */
     sortval = lookupKeyRead(c->db,c->argv[1]);
     if (sortval == NULL) {
-        addReply(c,shared.nokeyerr);
+        addReply(c,shared.nullmultibulk);
         return;
     }
     if (sortval->type != REDIS_SET && sortval->type != REDIS_LIST &&
@@ -5344,6 +5419,7 @@ static sds genRedisInfoString(void) {
         "changes_since_last_save:%lld\r\n"
         "bgsave_in_progress:%d\r\n"
         "last_save_time:%ld\r\n"
+        "bgrewriteaof_in_progress:%d\r\n"
         "total_connections_received:%lld\r\n"
         "total_commands_processed:%lld\r\n"
         "role:%s\r\n"
@@ -5358,6 +5434,7 @@ static sds genRedisInfoString(void) {
         server.dirty,
         server.bgsavechildpid != -1,
         server.lastsave,
+        server.bgrewritechildpid != -1,
         server.stat_numconnections,
         server.stat_numcommands,
         server.masterhost == NULL ? "master" : "slave"
@@ -5508,6 +5585,76 @@ static void ttlCommand(redisClient *c) {
         if (ttl < 0) ttl = -1;
     }
     addReplySds(c,sdscatprintf(sdsempty(),":%d\r\n",ttl));
+}
+
+/* ================================ MULTI/EXEC ============================== */
+
+/* Client state initialization for MULTI/EXEC */
+static void initClientMultiState(redisClient *c) {
+    c->mstate.commands = NULL;
+    c->mstate.count = 0;
+}
+
+/* Release all the resources associated with MULTI/EXEC state */
+static void freeClientMultiState(redisClient *c) {
+    int j;
+
+    for (j = 0; j < c->mstate.count; j++) {
+        int i;
+        multiCmd *mc = c->mstate.commands+j;
+
+        for (i = 0; i < mc->argc; i++)
+            decrRefCount(mc->argv[i]);
+        zfree(mc->argv);
+    }
+    zfree(c->mstate.commands);
+}
+
+/* Add a new command into the MULTI commands queue */
+static void queueMultiCommand(redisClient *c, struct redisCommand *cmd) {
+    multiCmd *mc;
+    int j;
+
+    c->mstate.commands = zrealloc(c->mstate.commands,
+            sizeof(multiCmd)*(c->mstate.count+1));
+    mc = c->mstate.commands+c->mstate.count;
+    mc->cmd = cmd;
+    mc->argc = c->argc;
+    mc->argv = zmalloc(sizeof(robj*)*c->argc);
+    memcpy(mc->argv,c->argv,sizeof(robj*)*c->argc);
+    for (j = 0; j < c->argc; j++)
+        incrRefCount(mc->argv[j]);
+    c->mstate.count++;
+}
+
+static void multiCommand(redisClient *c) {
+    c->flags |= REDIS_MULTI;
+    addReply(c,shared.ok);
+}
+
+static void execCommand(redisClient *c) {
+    int j;
+    robj **orig_argv;
+    int orig_argc;
+
+    if (!(c->flags & REDIS_MULTI)) {
+        addReplySds(c,sdsnew("-ERR EXEC without MULTI\r\n"));
+        return;
+    }
+
+    orig_argv = c->argv;
+    orig_argc = c->argc;
+    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",c->mstate.count));
+    for (j = 0; j < c->mstate.count; j++) {
+        c->argc = c->mstate.commands[j].argc;
+        c->argv = c->mstate.commands[j].argv;
+        call(c,c->mstate.commands[j].cmd);
+    }
+    c->argv = orig_argv;
+    c->argc = orig_argc;
+    freeClientMultiState(c);
+    initClientMultiState(c);
+    c->flags &= (~REDIS_MULTI);
 }
 
 /* =============================== Replication  ============================= */
@@ -5840,6 +5987,7 @@ static int syncWithMaster(void) {
     }
     server.master = createClient(fd);
     server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
     server.replstate = REDIS_REPL_CONNECTED;
     return REDIS_OK;
 }
@@ -6122,7 +6270,8 @@ static int fwriteBulk(FILE *fp, robj *obj) {
     obj = getDecodedObject(obj);
     snprintf(buf,sizeof(buf),"$%ld\r\n",(long)sdslen(obj->ptr));
     if (fwrite(buf,strlen(buf),1,fp) == 0) goto err;
-    if (fwrite(obj->ptr,sdslen(obj->ptr),1,fp) == 0) goto err;
+    if (sdslen(obj->ptr) && fwrite(obj->ptr,sdslen(obj->ptr),1,fp) == 0)
+        goto err;
     if (fwrite("\r\n",2,1,fp) == 0) goto err;
     decrRefCount(obj);
     return 1;
@@ -6251,7 +6400,7 @@ static int rewriteAppendOnlyFile(char *filename) {
             }
             /* Save the expire time */
             if (expiretime != -1) {
-                char cmd[]="*3\r\n$6\r\nEXPIRE\r\n";
+                char cmd[]="*3\r\n$8\r\nEXPIREAT\r\n";
                 /* If this key is already expired skip it */
                 if (expiretime < now) continue;
                 if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
@@ -6280,7 +6429,7 @@ static int rewriteAppendOnlyFile(char *filename) {
 werr:
     fclose(fp);
     unlink(tmpfile);
-    redisLog(REDIS_WARNING,"Write error writing append only fileon disk: %s", strerror(errno));
+    redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
     if (di) dictReleaseIterator(di);
     return REDIS_ERR;
 }
@@ -6339,7 +6488,8 @@ static void bgrewriteaofCommand(redisClient *c) {
         return;
     }
     if (rewriteAppendOnlyFileBackground() == REDIS_OK) {
-        addReply(c,shared.ok);
+        char *status = "+Background append only file rewriting started\r\n";
+        addReplySds(c,sdsnew(status));
     } else {
         addReply(c,shared.err);
     }
@@ -6368,6 +6518,14 @@ static void debugCommand(redisClient *c) {
             return;
         }
         redisLog(REDIS_WARNING,"DB reloaded by DEBUG RELOAD");
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
+        emptyDb();
+        if (loadAppendOnlyFile(server.appendfilename) != REDIS_OK) {
+            addReply(c,shared.err);
+            return;
+        }
+        redisLog(REDIS_WARNING,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         dictEntry *de = dictFind(c->db->dict,c->argv[2]);
