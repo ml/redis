@@ -1,18 +1,36 @@
 Redis TODO and Roadmap
 
-VERSION 1.4 TODO (Hash type)
-============================
+VERSION 2.0 TODO
+================
 
-* Blocking LPOP (BLPOP).
-* Hashes (HSET, HGET, HEXISTS, HLEN, ...).
+* BRPOPLPUSH
 * List ops like L/RPUSH L/RPOP should return the new list length.
+* Save dataset / fsync() on SIGTERM
+* MULTI/EXEC should support the "EXEC FSYNC" form?
+* BLPOP & C. tests (write a non blocking Tcl client as first step)
+* ZCOUNT sortedset min max
+* ZRANK: http://docs.google.com/viewer?a=v&q=cache:tCQaP3ZeN4YJ:courses.csail.mit.edu/6.046/spring04/handouts/ps5-sol.pdf+skip+list+rank+operation+augmented&hl=en&pid=bl&srcid=ADGEEShXuNjTcZyXw_1cq9OaWpSXy3PprjXqVzmM-LE0ETFznLyrDXJKQ_mBPNT10R8ErkoiXD9JbMw_FaoHmOA4yoGVrA7tZWiy393JwfCwuewuP93sjbkzZ_gnEp83jYhPYjThaIzw&sig=AHIEtbRF0GkYCdYRFtTJBE69senXZwFY0w
+* Once ZRANK is implemented, change the implementation of ZCOUNT to use the augmented skiplist in order to be much faster.
+* Write doc for ZCOUNT, and for open / closed intervals of sorted sets range operations.
 
-VERSION 1.6 TODO (Virtual memory)
-=================================
+Virtual Memory sub-TODO:
+* Check if the page selection algorithm is working well
+* Divide swappability of objects by refcount
+* Use multiple open FDs against the VM file, one for thread.
+* it should be possible to give the vm-max-memory option in megabyte, gigabyte, ..., just using 2GB, 100MB, and so forth.
+* Try to understand what can be moved into I/O threads that currently is instead handled by the main thread. For instance swapping file table scannig to find contiguous page could be a potential candidate (but I'm not convinced it's a good idea, better to improve the algorithm, for instance double the fast forward at every step?).
+* Possibly decrRefCount() against swapped objects can be moved into I/O threads, as it's a slow operation against million elements list, and in general consumes CPU time that can be consumed by other threads (and cores).
+* EXISTS should avoid loading the object if possible without too make the code too specialized.
+* vm-min-age <seconds> option
+* Make sure objects loaded from the VM are specially encoded when possible.
+* Check what happens performance-wise if instead to create threads again and again the same threads are reused forever. Note: this requires a way to disable this clients in the child, but waiting for empty new jobs queue can be enough.
+* Sets of integers are slow to load, for a number of reasons. Fix it. (use slow_sets.rdb file for debugging).
 
-* Redis Virtual Memory for datasets bigger than RAM (http://groups.google.com/group/redis-db/msg/752997c7b38553cd)
+* Hashes (GET/SET/DEL/INCRBY/EXISTS/FIELDS/LEN/MSET/MGET). Special encoding for hashes with less than N elements.
+* Write documentation for APPEND
+* Implement LEN, SUBSTR, PEEK, POKE, SETBIT, GETBIT
 
-VERSION 1.8 TODO (Fault tollerant sharding)
+VERSION 2.2 TODO (Fault tolerant sharding)
 ===========================================
 
 * Redis-cluster, a fast intermediate layer (proxy) that implements consistent hashing and fault tollerant nodes handling.
@@ -21,18 +39,13 @@ Interesting readings about this:
 
     - http://ayende.com/Blog/archive/2009/04/06/designing-rhino-dht-a-fault-tolerant-dynamically-distributed-hash.aspx
 
-VERSION 2.0 TODO (Optimizations and latency)
+VERSION 2.4 TODO (Optimizations and latency)
 ============================================
 
 * Lower the CPU usage.
 * Lower the RAM usage everywhere possible.
 * Use epool and alike to rewrite ae.c for Linux and other platforms suppporting fater-than-select() mutiplexing APIs.
 * Implement an UDP interface for low-latency GET/SET operations.
-
-VERSION 2.2 TODO (Optimizations and latency)
-============================================
-
-* JSON command able to access data serialized in JSON format. For instance if I've a key foobar with a json object I can alter the "name" file using somthing like: "JSON SET foobar name Kevin". We should have GET and INCRBY as well.
 
 OTHER IMPORTANT THINGS THAT WILL BE ADDED BUT I'M NOT SURE WHEN
 ===============================================================
@@ -42,7 +55,6 @@ BIG ONES:
 * Specially encoded memory-saving integer sets.
 * A command to export a JSON dump (there should be mostly working patch needing major reworking).
 * Specially encoded sets of integers (this includes a big refactoring providing an higher level layer for Sets manipulation)
-* ZRANK: http://docs.google.com/viewer?a=v&q=cache:tCQaP3ZeN4YJ:courses.csail.mit.edu/6.046/spring04/handouts/ps5-sol.pdf+skip+list+rank+operation+augmented&hl=en&pid=bl&srcid=ADGEEShXuNjTcZyXw_1cq9OaWpSXy3PprjXqVzmM-LE0ETFznLyrDXJKQ_mBPNT10R8ErkoiXD9JbMw_FaoHmOA4yoGVrA7tZWiy393JwfCwuewuP93sjbkzZ_gnEp83jYhPYjThaIzw&sig=AHIEtbRF0GkYCdYRFtTJBE69senXZwFY0w
 
 SMALL ONES:
 

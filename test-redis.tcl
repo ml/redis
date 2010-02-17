@@ -280,20 +280,46 @@ proc main {server port} {
         $r get foo
     } [string repeat "abcd" 1000000]
 
+    test {Very big payload random access} {
+        set err {}
+        array set payload {}
+        for {set j 0} {$j < 100} {incr j} {
+            set size [expr 1+[randomInt 100000]]
+            set buf [string repeat "pl-$j" $size]
+            set payload($j) $buf
+            $r set bigpayload_$j $buf
+        }
+        for {set j 0} {$j < 1000} {incr j} {
+            set index [randomInt 100]
+            set buf [$r get bigpayload_$index]
+            if {$buf != $payload($index)} {
+                set err "Values differ: I set '$payload($index)' but I read back '$buf'"
+                break
+            }
+        }
+        unset payload
+        set _ $err
+    } {}
+
     test {SET 10000 numeric keys and access all them in reverse order} {
+        set err {}
         for {set x 0} {$x < 10000} {incr x} {
             $r set $x $x
         }
         set sum 0
         for {set x 9999} {$x >= 0} {incr x -1} {
-            incr sum [$r get $x]
+            set val [$r get $x]
+            if {$val ne $x} {
+                set err "Eleemnt at position $x is $val instead of $x"
+                break
+            }
         }
-        format $sum
-    } {49995000}
+        set _ $err
+    } {}
 
-    test {DBSIZE should be 10001 now} {
+    test {DBSIZE should be 10101 now} {
         $r dbsize
-    } {10001}
+    } {10101}
 
     test {INCR against non existing key} {
         set res {}
@@ -1331,15 +1357,26 @@ proc main {server port} {
         list $v1 $v2 [$r zscore zset foo] [$r zscore zset bar]
     } {{bar foo} {foo bar} -2 6}
 
-    test {ZRANGEBYSCORE basics} {
+    test {ZRANGEBYSCORE and ZCOUNT basics} {
         $r del zset
         $r zadd zset 1 a
         $r zadd zset 2 b
         $r zadd zset 3 c
         $r zadd zset 4 d
         $r zadd zset 5 e
-        $r zrangebyscore zset 2 4
-    } {b c d}
+        list [$r zrangebyscore zset 2 4] [$r zrangebyscore zset (2 (4] \
+             [$r zcount zset 2 4] [$r zcount zset (2 (4]
+    } {{b c d} c 3 1}
+
+    test {ZRANGEBYSCORE withscores} {
+        $r del zset
+        $r zadd zset 1 a
+        $r zadd zset 2 b
+        $r zadd zset 3 c
+        $r zadd zset 4 d
+        $r zadd zset 5 e
+        $r zrangebyscore zset 2 4 withscores
+    } {b 2 c 3 d 4}
 
     test {ZRANGEBYSCORE fuzzy test, 100 ranges in 1000 elements sorted set} {
         set err {}
@@ -1358,10 +1395,39 @@ proc main {server port} {
             set low [$r zrangebyscore zset -inf $min]
             set ok [$r zrangebyscore zset $min $max]
             set high [$r zrangebyscore zset $max +inf]
+            set lowx [$r zrangebyscore zset -inf ($min]
+            set okx [$r zrangebyscore zset ($min ($max]
+            set highx [$r zrangebyscore zset ($max +inf]
+
+            if {[$r zcount zset -inf $min] != [llength $low]} {
+                append err "Error, len does not match zcount\n"
+            }
+            if {[$r zcount zset $min $max] != [llength $ok]} {
+                append err "Error, len does not match zcount\n"
+            }
+            if {[$r zcount zset $max +inf] != [llength $high]} {
+                append err "Error, len does not match zcount\n"
+            }
+            if {[$r zcount zset -inf ($min] != [llength $lowx]} {
+                append err "Error, len does not match zcount\n"
+            }
+            if {[$r zcount zset ($min ($max] != [llength $okx]} {
+                append err "Error, len does not match zcount\n"
+            }
+            if {[$r zcount zset ($max +inf] != [llength $highx]} {
+                append err "Error, len does not match zcount\n"
+            }
+
             foreach x $low {
                 set score [$r zscore zset $x]
                 if {$score > $min} {
                     append err "Error, score for $x is $score > $min\n"
+                }
+            }
+            foreach x $lowx {
+                set score [$r zscore zset $x]
+                if {$score >= $min} {
+                    append err "Error, score for $x is $score >= $min\n"
                 }
             }
             foreach x $ok {
@@ -1370,10 +1436,22 @@ proc main {server port} {
                     append err "Error, score for $x is $score outside $min-$max range\n"
                 }
             }
+            foreach x $okx {
+                set score [$r zscore zset $x]
+                if {$score <= $min || $score >= $max} {
+                    append err "Error, score for $x is $score outside $min-$max open range\n"
+                }
+            }
             foreach x $high {
                 set score [$r zscore zset $x]
                 if {$score < $max} {
                     append err "Error, score for $x is $score < $max\n"
+                }
+            }
+            foreach x $highx {
+                set score [$r zscore zset $x]
+                if {$score <= $max} {
+                    append err "Error, score for $x is $score <= $max\n"
                 }
             }
         }
@@ -1393,6 +1471,16 @@ proc main {server port} {
             [$r zrangebyscore zset 0 10 LIMIT 2 10] \
             [$r zrangebyscore zset 0 10 LIMIT 20 10]
     } {{a b} {c d e} {c d e} {}}
+
+    test {ZRANGEBYSCORE with LIMIT and withscores} {
+        $r del zset
+        $r zadd zset 10 a
+        $r zadd zset 20 b
+        $r zadd zset 30 c
+        $r zadd zset 40 d
+        $r zadd zset 50 e
+        $r zrangebyscore zset 20 50 LIMIT 2 3 withscores
+    } {d 40 e 50}
 
     test {ZREMRANGE basics} {
         $r del zset
@@ -1502,6 +1590,7 @@ proc main {server port} {
     }
 
     test {BGSAVE} {
+        waitForBgsave $r
         $r flushdb
         $r save
         $r set x 10
@@ -1618,6 +1707,41 @@ proc main {server port} {
         close $fd2
         set _ 1
     } {1}
+
+    test {MUTLI / EXEC basics} {
+        $r del mylist
+        $r rpush mylist a
+        $r rpush mylist b
+        $r rpush mylist c
+        $r multi
+        set v1 [$r lrange mylist 0 -1]
+        set v2 [$r ping]
+        set v3 [$r exec]
+        list $v1 $v2 $v3
+    } {QUEUED QUEUED {{a b c} PONG}}
+
+    test {APPEND basics} {
+        list [$r append foo bar] [$r get foo] \
+             [$r append foo 100] [$r get foo]
+    } {3 bar 6 bar100}
+
+    test {APPEND fuzzing} {
+        set err {}
+        foreach type {binary alpha compr} {
+            set buf {}
+            $r del x
+            for {set i 0} {$i < 1000} {incr i} {
+                set bin [randstring 0 10 $type]
+                append buf $bin
+                $r append x $bin
+            }
+            if {$buf != [$r get x]} {
+                set err "Expected '$buf' found '[$r get x]'"
+                break
+            }
+        }
+        set _ $err
+    } {}
 
     # Leave the user with a clean DB before to exit
     test {FLUSHDB} {

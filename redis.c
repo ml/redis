@@ -27,7 +27,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#define REDIS_VERSION "1.1.95"
+#define REDIS_VERSION "1.3.3"
 
 #include "fmacros.h"
 #include "config.h"
@@ -59,6 +59,7 @@
 #include <sys/uio.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 
 #if defined(__sun)
 #include "solarisfixes.h"
@@ -152,12 +153,31 @@
 #define REDIS_RDB_ENC_INT32 2       /* 32 bit signed integer */
 #define REDIS_RDB_ENC_LZF 3         /* string compressed with FASTLZ */
 
+/* Virtual memory object->where field. */
+#define REDIS_VM_MEMORY 0       /* The object is on memory */
+#define REDIS_VM_SWAPPED 1      /* The object is on disk */
+#define REDIS_VM_SWAPPING 2     /* Redis is swapping this object on disk */
+#define REDIS_VM_LOADING 3      /* Redis is loading this object from disk */
+
+/* Virtual memory static configuration stuff.
+ * Check vmFindContiguousPages() to know more about this magic numbers. */
+#define REDIS_VM_MAX_NEAR_PAGES 65536
+#define REDIS_VM_MAX_RANDOM_JUMP 4096
+#define REDIS_VM_MAX_THREADS 32
+#define REDIS_THREAD_STACK_SIZE (1024*1024*4)
+/* The following is the *percentage* of completed I/O jobs to process when the
+ * handelr is called. While Virtual Memory I/O operations are performed by
+ * threads, this operations must be processed by the main thread when completed
+ * in order to take effect. */
+#define REDIS_MAX_COMPLETED_JOBS_PROCESSED 1
+
 /* Client flags */
-#define REDIS_CLOSE 1       /* This client connection should be closed ASAP */
-#define REDIS_SLAVE 2       /* This client is a slave server */
-#define REDIS_MASTER 4      /* This client is a master server */
-#define REDIS_MONITOR 8      /* This client is a slave monitor, see MONITOR */
-#define REDIS_MULTI 16      /* This client is in a MULTI context */
+#define REDIS_SLAVE 1       /* This client is a slave server */
+#define REDIS_MASTER 2      /* This client is a master server */
+#define REDIS_MONITOR 4     /* This client is a slave monitor, see MONITOR */
+#define REDIS_MULTI 8       /* This client is in a MULTI context */
+#define REDIS_BLOCKED 16    /* The client is waiting in a blocking operation */
+#define REDIS_IO_WAIT 32    /* The client is waiting for Virtual Memory I/O */
 
 /* Slave replication state - slave side */
 #define REDIS_REPL_NONE 0   /* No active replication */
@@ -185,8 +205,9 @@
 
 /* Log levels */
 #define REDIS_DEBUG 0
-#define REDIS_NOTICE 1
-#define REDIS_WARNING 2
+#define REDIS_VERBOSE 1
+#define REDIS_NOTICE 2
+#define REDIS_WARNING 3
 
 /* Anti-warning macro... */
 #define REDIS_NOTUSED(V) ((void) V)
@@ -200,18 +221,35 @@
 #define APPENDFSYNC_EVERYSEC 2
 
 /* We can print the stacktrace, so our assert is defined this way: */
-#define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e),exit(1)))
-static void _redisAssert(char *estr);
+#define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
+static void _redisAssert(char *estr, char *file, int line);
 
 /*================================= Data types ============================== */
 
 /* A redis object, that is a type able to hold a string / list / set */
+
+/* The VM object structure */
+struct redisObjectVM {
+    off_t page;         /* the page at witch the object is stored on disk */
+    off_t usedpages;    /* number of pages used on disk */
+    time_t atime;       /* Last access time */
+} vm;
+
+/* The actual Redis Object */
 typedef struct redisObject {
     void *ptr;
     unsigned char type;
     unsigned char encoding;
-    unsigned char notused[2];
+    unsigned char storage;  /* If this object is a key, where is the value?
+                             * REDIS_VM_MEMORY, REDIS_VM_SWAPPED, ... */
+    unsigned char vtype; /* If this object is a key, and value is swapped out,
+                          * this is the type of the swapped out object. */
     int refcount;
+    /* VM fields, this are only allocated if VM is active, otherwise the
+     * object allocation function will just allocate
+     * sizeof(redisObjct) minus sizeof(redisObjectVM), so using
+     * Redis without VM active will not have any overhead. */
+    struct redisObjectVM vm;
 } robj;
 
 /* Macro used to initalize a Redis object allocated on the stack.
@@ -223,11 +261,14 @@ typedef struct redisObject {
     _var.type = REDIS_STRING; \
     _var.encoding = REDIS_ENCODING_RAW; \
     _var.ptr = _ptr; \
+    if (server.vm_enabled) _var.storage = REDIS_VM_MEMORY; \
 } while(0);
 
 typedef struct redisDb {
-    dict *dict;
-    dict *expires;
+    dict *dict;                 /* The keyspace for this DB */
+    dict *expires;              /* Timeout of keys with a timeout set */
+    dict *blockingkeys;         /* Keys with clients waiting for data (BLPOP) */
+    dict *io_keys;              /* Keys with clients waiting for VM I/O */
     int id;
 } redisDb;
 
@@ -257,8 +298,7 @@ typedef struct redisClient {
     list *reply;
     int sentlen;
     time_t lastinteraction; /* time of the last interaction, used for timeout */
-    int flags;              /* REDIS_CLOSE | REDIS_SLAVE | REDIS_MONITOR */
-                            /* REDIS_MULTI */
+    int flags;              /* REDIS_SLAVE | REDIS_MONITOR | REDIS_MULTI ... */
     int slaveseldb;         /* slave selected db, if this client is a slave */
     int authenticated;      /* when requirepass is non-NULL */
     int replstate;          /* replication state if this is a slave */
@@ -266,6 +306,13 @@ typedef struct redisClient {
     long repldboff;         /* replication DB file offset */
     off_t repldbsize;       /* replication DB file size */
     multiState mstate;      /* MULTI/EXEC state */
+    robj **blockingkeys;    /* The key we are waiting to terminate a blocking
+                             * operation such as BLPOP. Otherwise NULL. */
+    int blockingkeysnum;    /* Number of blocking keys */
+    time_t blockingto;      /* Blocking operation timeout. If UNIX current time
+                             * is >= blockingto then the operation timed out. */
+    list *io_keys;          /* Keys this client is waiting to be loaded from the
+                             * swap file in order to continue. */
 } redisClient;
 
 struct saveparam {
@@ -278,7 +325,7 @@ struct redisServer {
     int port;
     int fd;
     redisDb *db;
-    dict *sharingpool;
+    dict *sharingpool;          /* Poll used for object sharing */
     unsigned int sharingpoolsize;
     long long dirty;            /* changes to DB from the last save */
     list *clients;
@@ -288,7 +335,6 @@ struct redisServer {
     int cronloops;              /* number of times the cron function run */
     list *objfreelist;          /* A list of freed objects to avoid malloc() */
     time_t lastsave;            /* Unix time of last save succeeede */
-    size_t usedmemory;             /* Used memory in megabytes */
     /* Fields used only for stats */
     time_t stat_starttime;         /* server start time */
     long long stat_numcommands;    /* number of processed commands */
@@ -325,12 +371,53 @@ struct redisServer {
     redisClient *master;    /* client that is master for this slave */
     int replstate;
     unsigned int maxclients;
-    unsigned long maxmemory;
+    unsigned long long maxmemory;
+    unsigned int blpop_blocked_clients;
+    unsigned int vm_blocked_clients;
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
     int sort_alpha;
     int sort_bypattern;
+    /* Virtual memory configuration */
+    int vm_enabled;
+    char *vm_swap_file;
+    off_t vm_page_size;
+    off_t vm_pages;
+    unsigned long long vm_max_memory;
+    /* Virtual memory state */
+    FILE *vm_fp;
+    int vm_fd;
+    off_t vm_next_page; /* Next probably empty page */
+    off_t vm_near_pages; /* Number of pages allocated sequentially */
+    unsigned char *vm_bitmap; /* Bitmap of free/used pages */
+    time_t unixtime;    /* Unix time sampled every second. */
+    /* Virtual memory I/O threads stuff */
+    /* An I/O thread process an element taken from the io_jobs queue and
+     * put the result of the operation in the io_done list. While the
+     * job is being processed, it's put on io_processing queue. */
+    list *io_newjobs; /* List of VM I/O jobs yet to be processed */
+    list *io_processing; /* List of VM I/O jobs being processed */
+    list *io_processed; /* List of VM I/O jobs already processed */
+    list *io_ready_clients; /* Clients ready to be unblocked. All keys loaded */
+    pthread_mutex_t io_mutex; /* lock to access io_jobs/io_done/io_thread_job */
+    pthread_mutex_t obj_freelist_mutex; /* safe redis objects creation/free */
+    pthread_mutex_t io_swapfile_mutex; /* So we can lseek + write */
+    pthread_attr_t io_threads_attr; /* attributes for threads creation */
+    int io_active_threads; /* Number of running I/O threads */
+    int vm_max_threads; /* Max number of I/O threads running at the same time */
+    /* Our main thread is blocked on the event loop, locking for sockets ready
+     * to be read or written, so when a threaded I/O operation is ready to be
+     * processed by the main thread, the I/O thread will use a unix pipe to
+     * awake the main thread. The followings are the two pipe FDs. */
+    int io_ready_pipe_read;
+    int io_ready_pipe_write;
+    /* Virtual memory stats */
+    unsigned long long vm_stats_used_pages;
+    unsigned long long vm_stats_swapped_objects;
+    unsigned long long vm_stats_swapouts;
+    unsigned long long vm_stats_swapins;
+    FILE *devnull;
 };
 
 typedef void redisCommandProc(redisClient *c);
@@ -339,6 +426,10 @@ struct redisCommand {
     redisCommandProc *proc;
     int arity;
     int flags;
+    /* What keys should be loaded in background when calling this command? */
+    int vm_firstkey; /* The first argument that's a key (0 = no keys) */
+    int vm_lastkey;  /* THe last argument that's a key */
+    int vm_keystep;  /* The step between first and last key */
 };
 
 struct redisFunctionSym {
@@ -396,6 +487,22 @@ struct sharedObjectsStruct {
 
 static double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
+/* VM threaded I/O request message */
+#define REDIS_IOJOB_LOAD 0          /* Load from disk to memory */
+#define REDIS_IOJOB_PREPARE_SWAP 1  /* Compute needed pages */
+#define REDIS_IOJOB_DO_SWAP 2       /* Swap from memory to disk */
+typedef struct iojob {
+    int type;   /* Request type, REDIS_IOJOB_* */
+    redisDb *db;/* Redis database */
+    robj *key;  /* This I/O request is about swapping this key */
+    robj *val;  /* the value to swap for REDIS_IOREQ_*_SWAP, otherwise this
+                 * field is populated by the I/O thread for REDIS_IOREQ_LOAD. */
+    off_t page; /* Swap page where to read/write the object */
+    off_t pages; /* Swap pages needed to safe object. PREPARE_SWAP return val */
+    int canceled; /* True if this command was canceled by blocking side of VM */
+    pthread_t thread; /* ID of the thread processing this entry */
+} iojob;
+
 /*================================ Prototypes =============================== */
 
 static void freeStringObject(robj *o);
@@ -410,6 +517,7 @@ static void addReplySds(redisClient *c, sds s);
 static void incrRefCount(robj *o);
 static int rdbSaveBackground(char *filename);
 static robj *createStringObject(char *ptr, size_t len);
+static robj *dupStringObject(robj *o);
 static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int dictid, robj **argv, int argc);
 static void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
 static int syncWithMaster(void);
@@ -419,6 +527,7 @@ static robj *getDecodedObject(robj *o);
 static int removeExpire(redisDb *db, robj *key);
 static int expireIfNeeded(redisDb *db, robj *key);
 static int deleteIfVolatile(redisDb *db, robj *key);
+static int deleteIfSwapped(redisDb *db, robj *key);
 static int deleteKey(redisDb *db, robj *key);
 static time_t getExpire(redisDb *db, robj *key);
 static int setExpire(redisDb *db, robj *key, time_t when);
@@ -438,6 +547,36 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
 static void initClientMultiState(redisClient *c);
 static void freeClientMultiState(redisClient *c);
 static void queueMultiCommand(redisClient *c, struct redisCommand *cmd);
+static void unblockClientWaitingData(redisClient *c);
+static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele);
+static void vmInit(void);
+static void vmMarkPagesFree(off_t page, off_t count);
+static robj *vmLoadObject(robj *key);
+static robj *vmPreviewObject(robj *key);
+static int vmSwapOneObjectBlocking(void);
+static int vmSwapOneObjectThreaded(void);
+static int vmCanSwapOut(void);
+static int tryFreeOneObjectFromFreelist(void);
+static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata, int mask);
+static void vmCancelThreadedIOJob(robj *o);
+static void lockThreadedIO(void);
+static void unlockThreadedIO(void);
+static int vmSwapObjectThreaded(robj *key, robj *val, redisDb *db);
+static void freeIOJob(iojob *j);
+static void queueIOJob(iojob *j);
+static int vmWriteObjectOnSwap(robj *o, off_t page);
+static robj *vmReadObjectFromSwap(off_t page, int type);
+static void waitEmptyIOJobsQueue(void);
+static void vmReopenSwapFile(void);
+static int vmFreePage(off_t page);
+static int blockClientOnSwappedKeys(struct redisCommand *cmd, redisClient *c);
+static int dontWaitForSwappedKey(redisClient *c, robj *key);
+static void handleClientsBlockedOnSwappedKey(redisDb *db, robj *key);
+static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
+static struct redisCommand *lookupCommand(char *name);
+static void call(redisClient *c, struct redisCommand *cmd);
+static void resetClient(redisClient *c);
 
 
 static void authCommand(redisClient *c);
@@ -508,6 +647,7 @@ static void zaddCommand(redisClient *c);
 static void zincrbyCommand(redisClient *c);
 static void zrangeCommand(redisClient *c);
 static void zrangebyscoreCommand(redisClient *c);
+static void zcountCommand(redisClient *c);
 static void zrevrangeCommand(redisClient *c);
 static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
@@ -521,95 +661,102 @@ static void zinterstoreCommad(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
 static void multiCommand(redisClient *c);
 static void execCommand(redisClient *c);
+static void blpopCommand(redisClient *c);
+static void brpopCommand(redisClient *c);
+static void appendCommand(redisClient *c);
 
 /*================================= Globals ================================= */
 
 /* Global vars */
 static struct redisServer server; /* server global state */
 static struct redisCommand cmdTable[] = {
-    {"get",getCommand,2,REDIS_CMD_INLINE},
-    {"set",setCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"setnx",setnxCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"del",delCommand,-2,REDIS_CMD_INLINE},
-    {"exists",existsCommand,2,REDIS_CMD_INLINE},
-    {"incr",incrCommand,2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"decr",decrCommand,2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"mget",mgetCommand,-2,REDIS_CMD_INLINE},
-    {"rpush",rpushCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"lpush",lpushCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"rpop",rpopCommand,2,REDIS_CMD_INLINE},
-    {"lpop",lpopCommand,2,REDIS_CMD_INLINE},
-    {"llen",llenCommand,2,REDIS_CMD_INLINE},
-    {"lindex",lindexCommand,3,REDIS_CMD_INLINE},
-    {"lset",lsetCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"lrange",lrangeCommand,4,REDIS_CMD_INLINE},
-    {"ltrim",ltrimCommand,4,REDIS_CMD_INLINE},
-    {"lrem",lremCommand,4,REDIS_CMD_BULK},
-    {"rpoplpush",rpoplpushcommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"sadd",saddCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"srem",sremCommand,3,REDIS_CMD_BULK},
-    {"smove",smoveCommand,4,REDIS_CMD_BULK},
-    {"sismember",sismemberCommand,3,REDIS_CMD_BULK},
-    {"scard",scardCommand,2,REDIS_CMD_INLINE},
-    {"spop",spopCommand,2,REDIS_CMD_INLINE},
-    {"srandmember",srandmemberCommand,2,REDIS_CMD_INLINE},
-    {"sinter",sinterCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"sinterstore",sinterstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"sunion",sunionCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"sunionstore",sunionstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"sdiff",sdiffCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"sdiffstore",sdiffstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"smembers",sinterCommand,2,REDIS_CMD_INLINE},
-    {"zadd",zaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"zrem",zremCommand,3,REDIS_CMD_BULK},
-    {"zremrangebyscore",zremrangebyscoreCommand,4,REDIS_CMD_INLINE},
-    {"zrange",zrangeCommand,-4,REDIS_CMD_INLINE},
-    {"zrangebyscore",zrangebyscoreCommand,-4,REDIS_CMD_INLINE},
-    {"zrevrange",zrevrangeCommand,-4,REDIS_CMD_INLINE},
-    {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
-    {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"zrevrangeunion",zrevrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"zunionstore", zunionstoreCommand, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"zdiffrange", zdiffrangeCommand, -4, REDIS_CMD_INLINE},
-    {"zdiffrevrange", zdiffrevrangeCommand, -4, REDIS_CMD_INLINE},
-    {"zinterstore", zinterstoreCommad, -3, REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"mset",msetCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"msetnx",msetnxCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
-    {"randomkey",randomkeyCommand,1,REDIS_CMD_INLINE},
-    {"select",selectCommand,2,REDIS_CMD_INLINE},
-    {"move",moveCommand,3,REDIS_CMD_INLINE},
-    {"rename",renameCommand,3,REDIS_CMD_INLINE},
-    {"renamenx",renamenxCommand,3,REDIS_CMD_INLINE},
-    {"expire",expireCommand,3,REDIS_CMD_INLINE},
-    {"expireat",expireatCommand,3,REDIS_CMD_INLINE},
-    {"keys",keysCommand,2,REDIS_CMD_INLINE},
-    {"dbsize",dbsizeCommand,1,REDIS_CMD_INLINE},
-    {"auth",authCommand,2,REDIS_CMD_INLINE},
-    {"ping",pingCommand,1,REDIS_CMD_INLINE},
-    {"echo",echoCommand,2,REDIS_CMD_BULK},
-    {"save",saveCommand,1,REDIS_CMD_INLINE},
-    {"bgsave",bgsaveCommand,1,REDIS_CMD_INLINE},
-    {"bgrewriteaof",bgrewriteaofCommand,1,REDIS_CMD_INLINE},
-    {"shutdown",shutdownCommand,1,REDIS_CMD_INLINE},
-    {"lastsave",lastsaveCommand,1,REDIS_CMD_INLINE},
-    {"type",typeCommand,2,REDIS_CMD_INLINE},
-    {"multi",multiCommand,1,REDIS_CMD_INLINE},
-    {"exec",execCommand,1,REDIS_CMD_INLINE},
-    {"sync",syncCommand,1,REDIS_CMD_INLINE},
-    {"flushdb",flushdbCommand,1,REDIS_CMD_INLINE},
-    {"flushall",flushallCommand,1,REDIS_CMD_INLINE},
-    {"sort",sortCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
-    {"info",infoCommand,1,REDIS_CMD_INLINE},
-    {"monitor",monitorCommand,1,REDIS_CMD_INLINE},
-    {"ttl",ttlCommand,2,REDIS_CMD_INLINE},
-    {"slaveof",slaveofCommand,3,REDIS_CMD_INLINE},
-    {"debug",debugCommand,-2,REDIS_CMD_INLINE},
-    {NULL,NULL,0,0}
+    {"get",getCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"set",setCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,0,0,0},
+    {"setnx",setnxCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,0,0,0},
+    {"append",appendCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"del",delCommand,-2,REDIS_CMD_INLINE,0,0,0},
+    {"exists",existsCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"incr",incrCommand,2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,1,1},
+    {"decr",decrCommand,2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,1,1},
+    {"mget",mgetCommand,-2,REDIS_CMD_INLINE,1,-1,1},
+    {"rpush",rpushCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"lpush",lpushCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"rpop",rpopCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"lpop",lpopCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"brpop",brpopCommand,-3,REDIS_CMD_INLINE,1,1,1},
+    {"blpop",blpopCommand,-3,REDIS_CMD_INLINE,1,1,1},
+    {"llen",llenCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"lindex",lindexCommand,3,REDIS_CMD_INLINE,1,1,1},
+    {"lset",lsetCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"lrange",lrangeCommand,4,REDIS_CMD_INLINE,1,1,1},
+    {"ltrim",ltrimCommand,4,REDIS_CMD_INLINE,1,1,1},
+    {"lrem",lremCommand,4,REDIS_CMD_BULK,1,1,1},
+    {"rpoplpush",rpoplpushcommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,2,1},
+    {"sadd",saddCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"srem",sremCommand,3,REDIS_CMD_BULK,1,1,1},
+    {"smove",smoveCommand,4,REDIS_CMD_BULK,1,2,1},
+    {"sismember",sismemberCommand,3,REDIS_CMD_BULK,1,1,1},
+    {"scard",scardCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"spop",spopCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"srandmember",srandmemberCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"sinter",sinterCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,-1,1},
+    {"sinterstore",sinterstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"sunion",sunionCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,-1,1},
+    {"sunionstore",sunionstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"sdiff",sdiffCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,-1,1},
+    {"sdiffstore",sdiffstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"smembers",sinterCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"zadd",zaddCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"zincrby",zincrbyCommand,4,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"zrem",zremCommand,3,REDIS_CMD_BULK,1,1,1},
+    {"zremrangebyscore",zremrangebyscoreCommand,4,REDIS_CMD_INLINE,1,1,1},
+    {"zrange",zrangeCommand,-4,REDIS_CMD_INLINE,1,1,1},
+    {"zrangebyscore",zrangebyscoreCommand,-4,REDIS_CMD_INLINE,1,1,1},
+    {"zcount",zcountCommand,4,REDIS_CMD_INLINE,1,1,1},
+    {"zrevrange",zrevrangeCommand,-4,REDIS_CMD_INLINE,1,1,1},
+    {"zrangeunion",zrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"zrevrangeunion",zrevrangeunionCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"zunionstore",zunionstoreCommand,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,3,-1,1},
+    {"zdiffrange",zdiffrangeCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"zdiffrevrange",zdiffrevrangeCommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,2,-1,1},
+    {"zinterstore",zinterstoreCommad,-3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,-1,1},
+    {"zcard",zcardCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,1,1},
+    {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,1,1},
+    {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,1,1},
+    {"mset",msetCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,-1,2},
+    {"msetnx",msetnxCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,1,-1,2},
+    {"randomkey",randomkeyCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"select",selectCommand,2,REDIS_CMD_INLINE,0,0,0},
+    {"move",moveCommand,3,REDIS_CMD_INLINE,1,1,1},
+    {"rename",renameCommand,3,REDIS_CMD_INLINE,1,1,1},
+    {"renamenx",renamenxCommand,3,REDIS_CMD_INLINE,1,1,1},
+    {"expire",expireCommand,3,REDIS_CMD_INLINE,0,0,0},
+    {"expireat",expireatCommand,3,REDIS_CMD_INLINE,0,0,0},
+    {"keys",keysCommand,2,REDIS_CMD_INLINE,0,0,0},
+    {"dbsize",dbsizeCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"auth",authCommand,2,REDIS_CMD_INLINE,0,0,0},
+    {"ping",pingCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"echo",echoCommand,2,REDIS_CMD_BULK,0,0,0},
+    {"save",saveCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"bgsave",bgsaveCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"bgrewriteaof",bgrewriteaofCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"shutdown",shutdownCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"lastsave",lastsaveCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"type",typeCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"multi",multiCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"exec",execCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"sync",syncCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"flushdb",flushdbCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"flushall",flushallCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"sort",sortCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,1,1,1},
+    {"info",infoCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"monitor",monitorCommand,1,REDIS_CMD_INLINE,0,0,0},
+    {"ttl",ttlCommand,2,REDIS_CMD_INLINE,1,1,1},
+    {"slaveof",slaveofCommand,3,REDIS_CMD_INLINE,0,0,0},
+    {"debug",debugCommand,-2,REDIS_CMD_INLINE,0,0,0},
+    {NULL,NULL,0,0,0,0,0}
 };
 
 /*============================ Utility functions ============================ */
@@ -746,13 +893,13 @@ static void redisLog(int level, const char *fmt, ...) {
 
     va_start(ap, fmt);
     if (level >= server.verbosity) {
-        char *c = ".-*";
+        char *c = ".-*#";
         char buf[64];
         time_t now;
 
         now = time(NULL);
         strftime(buf,64,"%d %b %H:%M:%S",localtime(&now));
-        fprintf(fp,"%s %c ",buf,c[level]);
+        fprintf(fp,"[%d] %s %c ",(int)getpid(),buf,c[level]);
         vfprintf(fp, fmt, ap);
         fprintf(fp,"\n");
         fflush(fp);
@@ -774,6 +921,12 @@ static void dictVanillaFree(void *privdata, void *val)
     zfree(val);
 }
 
+static void dictListDestructor(void *privdata, void *val)
+{
+    DICT_NOTUSED(privdata);
+    listRelease((list*)val);
+}
+
 static int sdsDictKeyCompare(void *privdata, const void *key1,
         const void *key2)
 {
@@ -790,6 +943,7 @@ static void dictRedisObjectDestructor(void *privdata, void *val)
 {
     DICT_NOTUSED(privdata);
 
+    if (val == NULL) return; /* Values of swapped out keys as set to NULL */
     decrRefCount(val);
 }
 
@@ -822,12 +976,27 @@ static int dictEncObjKeyCompare(void *privdata, const void *key1,
 static unsigned int dictEncObjHash(const void *key) {
     robj *o = (robj*) key;
 
-    o = getDecodedObject(o);
-    unsigned int hash = dictGenHashFunction(o->ptr, sdslen((sds)o->ptr));
-    decrRefCount(o);
-    return hash;
+    if (o->encoding == REDIS_ENCODING_RAW) {
+        return dictGenHashFunction(o->ptr, sdslen((sds)o->ptr));
+    } else {
+        if (o->encoding == REDIS_ENCODING_INT) {
+            char buf[32];
+            int len;
+
+            len = snprintf(buf,32,"%ld",(long)o->ptr);
+            return dictGenHashFunction((unsigned char*)buf, len);
+        } else {
+            unsigned int hash;
+
+            o = getDecodedObject(o);
+            hash = dictGenHashFunction(o->ptr, sdslen((sds)o->ptr));
+            decrRefCount(o);
+            return hash;
+        }
+    }
 }
 
+/* Sets type and expires */
 static dictType setDictType = {
     dictEncObjHash,            /* hash function */
     NULL,                      /* key dup */
@@ -837,6 +1006,7 @@ static dictType setDictType = {
     NULL                       /* val destructor */
 };
 
+/* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
 static dictType zsetDictType = {
     dictEncObjHash,            /* hash function */
     NULL,                      /* key dup */
@@ -846,6 +1016,7 @@ static dictType zsetDictType = {
     dictVanillaFree            /* val destructor of malloc(sizeof(double)) */
 };
 
+/* Db->dict */
 static dictType hashDictType = {
     dictObjHash,                /* hash function */
     NULL,                       /* key dup */
@@ -853,6 +1024,28 @@ static dictType hashDictType = {
     dictObjKeyCompare,          /* key compare */
     dictRedisObjectDestructor,  /* key destructor */
     dictRedisObjectDestructor   /* val destructor */
+};
+
+/* Db->expires */
+static dictType keyptrDictType = {
+    dictObjHash,               /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictObjKeyCompare,         /* key compare */
+    dictRedisObjectDestructor, /* key destructor */
+    NULL                       /* val destructor */
+};
+
+/* Keylist hash table type has unencoded redis objects as keys and
+ * lists as values. It's used for blocking operations (BLPOP) and to
+ * map swapped keys to a list of clients waiting for this keys to be loaded. */
+static dictType keylistDictType = {
+    dictObjHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictObjKeyCompare,          /* key compare */
+    dictRedisObjectDestructor,  /* key destructor */
+    dictListDestructor          /* val destructor */
 };
 
 /* ========================= Random utility functions ======================= */
@@ -873,15 +1066,23 @@ static void closeTimedoutClients(void) {
     redisClient *c;
     listNode *ln;
     time_t now = time(NULL);
+    listIter li;
 
-    listRewind(server.clients);
-    while ((ln = listYield(server.clients)) != NULL) {
+    listRewind(server.clients,&li);
+    while ((ln = listNext(&li)) != NULL) {
         c = listNodeValue(ln);
-        if (!(c->flags & REDIS_SLAVE) &&    /* no timeout for slaves */
+        if (server.maxidletime &&
+            !(c->flags & REDIS_SLAVE) &&    /* no timeout for slaves */
             !(c->flags & REDIS_MASTER) &&   /* no timeout for masters */
-             (now - c->lastinteraction > server.maxidletime)) {
-            redisLog(REDIS_DEBUG,"Closing idle client");
+             (now - c->lastinteraction > server.maxidletime))
+        {
+            redisLog(REDIS_VERBOSE,"Closing idle client");
             freeClient(c);
+        } else if (c->flags & REDIS_BLOCKED) {
+            if (c->blockingto != 0 && c->blockingto < now) {
+                addReply(c,shared.nullmultibulk);
+                unblockClientWaitingData(c);
+            }
         }
     }
 }
@@ -902,9 +1103,9 @@ static void tryResizeHashTables(void) {
 
     for (j = 0; j < server.dbnum; j++) {
         if (htNeedsResize(server.db[j].dict)) {
-            redisLog(REDIS_DEBUG,"The hash table %d is too sparse, resize it...",j);
+            redisLog(REDIS_VERBOSE,"The hash table %d is too sparse, resize it...",j);
             dictResize(server.db[j].dict);
-            redisLog(REDIS_DEBUG,"Hash table %d resized.",j);
+            redisLog(REDIS_VERBOSE,"Hash table %d resized.",j);
         }
         if (htNeedsResize(server.db[j].expires))
             dictResize(server.db[j].expires);
@@ -1001,8 +1202,11 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
     REDIS_NOTUSED(id);
     REDIS_NOTUSED(clientData);
 
-    /* Update the global state with the amount of used memory */
-    server.usedmemory = zmalloc_used_memory();
+    /* We take a cached value of the unix time in the global state because
+     * with virtual memory and aging there is to store the current time
+     * in objects at every object access, and accuracy is not needed.
+     * To access a global var is faster than calling time(NULL) */
+    server.unixtime = time(NULL);
 
     /* Show some info about non-empty databases */
     for (j = 0; j < server.dbnum; j++) {
@@ -1012,7 +1216,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         used = dictSize(server.db[j].dict);
         vkeys = dictSize(server.db[j].expires);
         if (!(loops % 5) && (used || vkeys)) {
-            redisLog(REDIS_DEBUG,"DB %d: %lld keys (%lld volatile) in %lld slots HT.",j,used,vkeys,size);
+            redisLog(REDIS_VERBOSE,"DB %d: %lld keys (%lld volatile) in %lld slots HT.",j,used,vkeys,size);
             /* dictPrintStats(server.dict); */
         }
     }
@@ -1027,15 +1231,15 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
     /* Show information about connected clients */
     if (!(loops % 5)) {
-        redisLog(REDIS_DEBUG,"%d clients connected (%d slaves), %zu bytes in use, %d shared objects",
+        redisLog(REDIS_VERBOSE,"%d clients connected (%d slaves), %zu bytes in use, %d shared objects",
             listLength(server.clients)-listLength(server.slaves),
             listLength(server.slaves),
-            server.usedmemory,
+            zmalloc_used_memory(),
             dictSize(server.sharingpool));
     }
 
     /* Close connections of timedout clients */
-    if (server.maxidletime && !(loops % 10))
+    if ((server.maxidletime && !(loops % 10)) || server.blpop_blocked_clients)
         closeTimedoutClients();
 
     /* Check if a background saving or AOF rewrite in progress terminated */
@@ -1078,7 +1282,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         /* Continue to expire if at the end of the cycle more than 25%
          * of the keys were expired. */
         do {
-            int num = dictSize(db->expires);
+            long num = dictSize(db->expires);
             time_t now = time(NULL);
 
             expired = 0;
@@ -1098,6 +1302,32 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         } while (expired > REDIS_EXPIRELOOKUPS_PER_CRON/4);
     }
 
+    /* Swap a few keys on disk if we are over the memory limit and VM
+     * is enbled. Try to free objects from the free list first. */
+    if (vmCanSwapOut()) {
+        while (server.vm_enabled && zmalloc_used_memory() >
+                server.vm_max_memory)
+        {
+            int retval;
+
+            if (tryFreeOneObjectFromFreelist() == REDIS_OK) continue;
+            retval = (server.vm_max_threads == 0) ?
+                        vmSwapOneObjectBlocking() :
+                        vmSwapOneObjectThreaded();
+            if (retval == REDIS_ERR && (loops % 30) == 0 &&
+                zmalloc_used_memory() >
+                (server.vm_max_memory+server.vm_max_memory/10))
+            {
+                redisLog(REDIS_WARNING,"WARNING: vm-max-memory limit exceeded by more than 10%% but unable to swap more objects out!");
+            }
+            /* Note that when using threade I/O we free just one object,
+             * because anyway when the I/O thread in charge to swap this
+             * object out will finish, the handler of completed jobs
+             * will try to swap more objects if we are still out of memory. */
+            if (retval == REDIS_ERR || server.vm_max_threads > 0) break;
+        }
+    }
+
     /* Check if we should connect to a MASTER */
     if (server.replstate == REDIS_REPL_CONNECT) {
         redisLog(REDIS_NOTICE,"Connecting to MASTER...");
@@ -1106,6 +1336,38 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         }
     }
     return 1000;
+}
+
+/* This function gets called every time Redis is entering the
+ * main loop of the event driven library, that is, before to sleep
+ * for ready file descriptors. */
+static void beforeSleep(struct aeEventLoop *eventLoop) {
+    REDIS_NOTUSED(eventLoop);
+
+    if (server.vm_enabled && listLength(server.io_ready_clients)) {
+        listIter li;
+        listNode *ln;
+
+        listRewind(server.io_ready_clients,&li);
+        while((ln = listNext(&li))) {
+            redisClient *c = ln->value;
+            struct redisCommand *cmd;
+
+            /* Resume the client. */
+            listDelNode(server.io_ready_clients,ln);
+            c->flags &= (~REDIS_IO_WAIT);
+            server.vm_blocked_clients--;
+            aeCreateFileEvent(server.el, c->fd, AE_READABLE,
+                readQueryFromClient, c);
+            cmd = lookupCommand(c->argv[0]->ptr);
+            assert(cmd != NULL);
+            call(c,cmd);
+            resetClient(c);
+            /* There may be more data to process in the input buffer. */
+            if (c->querybuf && sdslen(c->querybuf) > 0)
+                processInputBuffer(c);
+        }
+    }
 }
 
 static void createSharedObjects(void) {
@@ -1161,7 +1423,7 @@ static void resetServerSaveParams() {
 static void initServerConfig() {
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.port = REDIS_SERVERPORT;
-    server.verbosity = REDIS_DEBUG;
+    server.verbosity = REDIS_VERBOSE;
     server.maxidletime = REDIS_MAXIDLETIME;
     server.saveparams = NULL;
     server.logfile = NULL; /* NULL = log on standard output */
@@ -1181,7 +1443,16 @@ static void initServerConfig() {
     server.rdbcompression = 1;
     server.sharingpoolsize = 1024;
     server.maxclients = 0;
+    server.blpop_blocked_clients = 0;
     server.maxmemory = 0;
+    server.vm_enabled = 0;
+    server.vm_swap_file = zstrdup("/tmp/redis-%p.vm");
+    server.vm_page_size = 256;          /* 256 bytes per page */
+    server.vm_pages = 1024*1024*100;    /* 104 millions of pages */
+    server.vm_max_memory = 1024LL*1024*1024*1; /* 1 GB of RAM */
+    server.vm_max_threads = 4;
+    server.vm_blocked_clients = 0;
+
     resetServerSaveParams();
 
     appendServerSaveParams(60*60,1);  /* save after 1 hour and 1 change */
@@ -1209,6 +1480,11 @@ static void initServer() {
     signal(SIGPIPE, SIG_IGN);
     setupSigSegvAction();
 
+    server.devnull = fopen("/dev/null","w");
+    if (server.devnull == NULL) {
+        redisLog(REDIS_WARNING, "Can't open /dev/null: %s", server.neterr);
+        exit(1);
+    }
     server.clients = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
@@ -1224,7 +1500,10 @@ static void initServer() {
     }
     for (j = 0; j < server.dbnum; j++) {
         server.db[j].dict = dictCreate(&hashDictType,NULL);
-        server.db[j].expires = dictCreate(&setDictType,NULL);
+        server.db[j].expires = dictCreate(&keyptrDictType,NULL);
+        server.db[j].blockingkeys = dictCreate(&keylistDictType,NULL);
+        if (server.vm_enabled)
+            server.db[j].io_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].id = j;
     }
     server.cronloops = 0;
@@ -1233,11 +1512,13 @@ static void initServer() {
     server.bgrewritebuf = sdsempty();
     server.lastsave = time(NULL);
     server.dirty = 0;
-    server.usedmemory = 0;
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_starttime = time(NULL);
+    server.unixtime = time(NULL);
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
+    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
+        acceptHandler, NULL) == AE_ERR) oom("creating file event");
 
     if (server.appendonly) {
         server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
@@ -1247,6 +1528,8 @@ static void initServer() {
             exit(1);
         }
     }
+
+    if (server.vm_enabled) vmInit();
 }
 
 /* Empty the whole database */
@@ -1331,6 +1614,7 @@ static void loadServerConfig(char *filename) {
             }
         } else if (!strcasecmp(argv[0],"loglevel") && argc == 2) {
             if (!strcasecmp(argv[1],"debug")) server.verbosity = REDIS_DEBUG;
+            else if (!strcasecmp(argv[1],"verbose")) server.verbosity = REDIS_VERBOSE;
             else if (!strcasecmp(argv[1],"notice")) server.verbosity = REDIS_NOTICE;
             else if (!strcasecmp(argv[1],"warning")) server.verbosity = REDIS_WARNING;
             else {
@@ -1408,11 +1692,26 @@ static void loadServerConfig(char *filename) {
                 goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"requirepass") && argc == 2) {
-          server.requirepass = zstrdup(argv[1]);
+            server.requirepass = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"pidfile") && argc == 2) {
-          server.pidfile = zstrdup(argv[1]);
+            server.pidfile = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"dbfilename") && argc == 2) {
-          server.dbfilename = zstrdup(argv[1]);
+            server.dbfilename = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"vm-enabled") && argc == 2) {
+            if ((server.vm_enabled = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"vm-swap-file") && argc == 2) {
+            zfree(server.vm_swap_file);
+            server.vm_swap_file = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"vm-max-memory") && argc == 2) {
+            server.vm_max_memory = strtoll(argv[1], NULL, 10);
+        } else if (!strcasecmp(argv[0],"vm-page-size") && argc == 2) {
+            server.vm_page_size = strtoll(argv[1], NULL, 10);
+        } else if (!strcasecmp(argv[0],"vm-pages") && argc == 2) {
+            server.vm_pages = strtoll(argv[1], NULL, 10);
+        } else if (!strcasecmp(argv[0],"vm-max-threads") && argc == 2) {
+            server.vm_max_threads = strtoll(argv[1], NULL, 10);
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -1446,15 +1745,39 @@ static void freeClientArgv(redisClient *c) {
 static void freeClient(redisClient *c) {
     listNode *ln;
 
+    /* Note that if the client we are freeing is blocked into a blocking
+     * call, we have to set querybuf to NULL *before* to call
+     * unblockClientWaitingData() to avoid processInputBuffer() will get
+     * called. Also it is important to remove the file events after
+     * this, because this call adds the READABLE event. */
+    sdsfree(c->querybuf);
+    c->querybuf = NULL;
+    if (c->flags & REDIS_BLOCKED)
+        unblockClientWaitingData(c);
+
     aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
     aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
-    sdsfree(c->querybuf);
     listRelease(c->reply);
     freeClientArgv(c);
     close(c->fd);
+    /* Remove from the list of clients */
     ln = listSearchKey(server.clients,c);
     redisAssert(ln != NULL);
     listDelNode(server.clients,ln);
+    /* Remove from the list of clients waiting for swapped keys */
+    if (c->flags & REDIS_IO_WAIT && listLength(c->io_keys) == 0) {
+        ln = listSearchKey(server.io_ready_clients,c);
+        if (ln) {
+            listDelNode(server.io_ready_clients,ln);
+            server.vm_blocked_clients--;
+        }
+    }
+    while (server.vm_enabled && listLength(c->io_keys)) {
+        ln = listFirst(c->io_keys);
+        dontWaitForSwappedKey(c,ln->value);
+    }
+    listRelease(c->io_keys);
+    /* Other cleanup */
     if (c->flags & REDIS_SLAVE) {
         if (c->replstate == REDIS_REPL_SEND_BULK && c->repldbfd != -1)
             close(c->repldbfd);
@@ -1478,10 +1801,11 @@ static void glueReplyBuffersIfNeeded(redisClient *c) {
     int copylen = 0;
     char buf[GLUEREPLY_UP_TO];
     listNode *ln;
+    listIter li;
     robj *o;
 
-    listRewind(c->reply);
-    while((ln = listYield(c->reply))) {
+    listRewind(c->reply,&li);
+    while((ln = listNext(&li))) {
         int objlen;
 
         o = ln->value;
@@ -1553,7 +1877,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
         if (errno == EAGAIN) {
             nwritten = 0;
         } else {
-            redisLog(REDIS_DEBUG,
+            redisLog(REDIS_VERBOSE,
                 "Error writing to client: %s", strerror(errno));
             freeClient(c);
             return;
@@ -1606,7 +1930,7 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
         /* write all collected blocks at once */
         if((nwritten = writev(fd, iov, ion)) < 0) {
             if (errno != EAGAIN) {
-                redisLog(REDIS_DEBUG,
+                redisLog(REDIS_VERBOSE,
                          "Error writing to client: %s", strerror(errno));
                 freeClient(c);
                 return;
@@ -1763,6 +2087,9 @@ static int processCommand(redisClient *c) {
         freeClient(c);
         return 0;
     }
+
+    /* Now lookup the command and check ASAP about trivial error conditions
+     * such wrong arity, bad command name and so forth. */
     cmd = lookupCommand(c->argv[0]->ptr);
     if (!cmd) {
         addReplySds(c,
@@ -1783,6 +2110,7 @@ static int processCommand(redisClient *c) {
         resetClient(c);
         return 1;
     } else if (cmd->flags & REDIS_CMD_BULK && c->bulklen == -1) {
+        /* This is a bulk command, we have to read the last argument yet. */
         int bulklen = atoi(c->argv[c->argc-1]->ptr);
 
         decrRefCount(c->argv[c->argc-1]);
@@ -1804,6 +2132,8 @@ static int processCommand(redisClient *c) {
             c->argc++;
             c->querybuf = sdsrange(c->querybuf,c->bulklen,-1);
         } else {
+            /* Otherwise return... there is to read the last argument
+             * from the socket. */
             return 1;
         }
     }
@@ -1829,20 +2159,19 @@ static int processCommand(redisClient *c) {
         queueMultiCommand(c,cmd);
         addReply(c,shared.queued);
     } else {
+        if (server.vm_enabled && server.vm_max_threads > 0 &&
+            blockClientOnSwappedKeys(cmd,c)) return 1;
         call(c,cmd);
     }
 
     /* Prepare the client for the next command */
-    if (c->flags & REDIS_CLOSE) {
-        freeClient(c);
-        return 0;
-    }
     resetClient(c);
     return 1;
 }
 
 static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int dictid, robj **argv, int argc) {
     listNode *ln;
+    listIter li;
     int outc = 0, j;
     robj **outv;
     /* (args*2)+1 is enough room for args, spaces, newlines */
@@ -1873,8 +2202,8 @@ static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int di
      * be sure to free objects if there is no slave in a replication state
      * able to be feed with commands */
     for (j = 0; j < outc; j++) incrRefCount(outv[j]);
-    listRewind(slaves);
-    while((ln = listYield(slaves))) {
+    listRewind(slaves,&li);
+    while((ln = listNext(&li))) {
         redisClient *slave = ln->value;
 
         /* Don't feed slaves that are still waiting for BGSAVE to start */
@@ -1912,6 +2241,13 @@ static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int di
 
 static void processInputBuffer(redisClient *c) {
 again:
+    /* Before to process the input buffer, make sure the client is not
+     * waitig for a blocking operation such as BLPOP. Note that the first
+     * iteration the client is never blocked, otherwise the processInputBuffer
+     * would not be called at all, but after the execution of the first commands
+     * in the input buffer the client may be blocked, and the "goto again"
+     * will try to reiterate. The following line will make it return asap. */
+    if (c->flags & REDIS_BLOCKED || c->flags & REDIS_IO_WAIT) return;
     if (c->bulklen == -1) {
         /* Read the first line of the query */
         char *p = strchr(c->querybuf,'\n');
@@ -1960,7 +2296,7 @@ again:
             }
             return;
         } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
-            redisLog(REDIS_DEBUG, "Client protocol error");
+            redisLog(REDIS_VERBOSE, "Client protocol error");
             freeClient(c);
             return;
         }
@@ -1997,12 +2333,12 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
         if (errno == EAGAIN) {
             nread = 0;
         } else {
-            redisLog(REDIS_DEBUG, "Reading from client: %s",strerror(errno));
+            redisLog(REDIS_VERBOSE, "Reading from client: %s",strerror(errno));
             freeClient(c);
             return;
         }
     } else if (nread == 0) {
-        redisLog(REDIS_DEBUG, "Client closed connection");
+        redisLog(REDIS_VERBOSE, "Client closed connection");
         freeClient(c);
         return;
     }
@@ -2050,6 +2386,10 @@ static redisClient *createClient(int fd) {
     c->reply = listCreate();
     listSetFreeMethod(c->reply,decrRefCount);
     listSetDupMethod(c->reply,dupClientReplyValue);
+    c->blockingkeys = NULL;
+    c->blockingkeysnum = 0;
+    c->io_keys = listCreate();
+    listSetFreeMethod(c->io_keys,decrRefCount);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
         freeClient(c);
@@ -2066,6 +2406,11 @@ static void addReply(redisClient *c, robj *obj) {
          c->replstate == REDIS_REPL_ONLINE) &&
         aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
         sendReplyToClient, c) == AE_ERR) return;
+
+    if (server.vm_enabled && obj->storage != REDIS_VM_MEMORY) {
+        obj = dupStringObject(obj);
+        obj->refcount = 0; /* getDecodedObject() will increment the refcount */
+    }
     listAddNodeTail(c->reply,getDecodedObject(obj));
 }
 
@@ -2081,6 +2426,14 @@ static void addReplyDouble(redisClient *c, double d) {
     snprintf(buf,sizeof(buf),"%.17g",d);
     addReplySds(c,sdscatprintf(sdsempty(),"$%lu\r\n%s\r\n",
         (unsigned long) strlen(buf),buf));
+}
+
+static void addReplyLong(redisClient *c, long l) {
+    char buf[128];
+    size_t len;
+
+    len = snprintf(buf,sizeof(buf),":%ld\r\n",l);
+    addReplySds(c,sdsnewlen(buf,len));
 }
 
 static void addReplyBulkLen(redisClient *c, robj *obj) {
@@ -2114,10 +2467,10 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     cfd = anetAccept(server.neterr, fd, cip, &cport);
     if (cfd == AE_ERR) {
-        redisLog(REDIS_DEBUG,"Accepting client connection: %s", server.neterr);
+        redisLog(REDIS_VERBOSE,"Accepting client connection: %s", server.neterr);
         return;
     }
-    redisLog(REDIS_DEBUG,"Accepted %s:%d", cip, cport);
+    redisLog(REDIS_VERBOSE,"Accepted %s:%d", cip, cport);
     if ((c = createClient(cfd)) == NULL) {
         redisLog(REDIS_WARNING,"Error allocating resoures for the client");
         close(cfd); /* May be already closed, just ingore errors */
@@ -2145,22 +2498,42 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 static robj *createObject(int type, void *ptr) {
     robj *o;
 
+    if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
     if (listLength(server.objfreelist)) {
         listNode *head = listFirst(server.objfreelist);
         o = listNodeValue(head);
         listDelNode(server.objfreelist,head);
+        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
     } else {
-        o = zmalloc(sizeof(*o));
+        if (server.vm_enabled) {
+            pthread_mutex_unlock(&server.obj_freelist_mutex);
+            o = zmalloc(sizeof(*o));
+        } else {
+            o = zmalloc(sizeof(*o)-sizeof(struct redisObjectVM));
+        }
     }
     o->type = type;
     o->encoding = REDIS_ENCODING_RAW;
     o->ptr = ptr;
     o->refcount = 1;
+    if (server.vm_enabled) {
+        /* Note that this code may run in the context of an I/O thread
+         * and accessing to server.unixtime in theory is an error
+         * (no locks). But in practice this is safe, and even if we read
+         * garbage Redis will not fail, as it's just a statistical info */
+        o->vm.atime = server.unixtime;
+        o->storage = REDIS_VM_MEMORY;
+    }
     return o;
 }
 
 static robj *createStringObject(char *ptr, size_t len) {
     return createObject(REDIS_STRING,sdsnewlen(ptr,len));
+}
+
+static robj *dupStringObject(robj *o) {
+    assert(o->encoding == REDIS_ENCODING_RAW);
+    return createStringObject(o->ptr,sdslen(o->ptr));
 }
 
 static robj *createListObject(void) {
@@ -2210,21 +2583,37 @@ static void freeHashObject(robj *o) {
 }
 
 static void incrRefCount(robj *o) {
+    redisAssert(!server.vm_enabled || o->storage == REDIS_VM_MEMORY);
     o->refcount++;
-#ifdef DEBUG_REFCOUNT
-    if (o->type == REDIS_STRING)
-        printf("Increment '%s'(%p), now is: %d\n",o->ptr,o,o->refcount);
-#endif
 }
 
 static void decrRefCount(void *obj) {
     robj *o = obj;
 
-#ifdef DEBUG_REFCOUNT
-    if (o->type == REDIS_STRING)
-        printf("Decrement '%s'(%p), now is: %d\n",o->ptr,o,o->refcount-1);
-#endif
+    /* Object is a key of a swapped out value, or in the process of being
+     * loaded. */
+    if (server.vm_enabled &&
+        (o->storage == REDIS_VM_SWAPPED || o->storage == REDIS_VM_LOADING))
+    {
+        if (o->storage == REDIS_VM_SWAPPED || o->storage == REDIS_VM_LOADING) {
+            redisAssert(o->refcount == 1);
+        }
+        if (o->storage == REDIS_VM_LOADING) vmCancelThreadedIOJob(obj);
+        redisAssert(o->type == REDIS_STRING);
+        freeStringObject(o);
+        vmMarkPagesFree(o->vm.page,o->vm.usedpages);
+        pthread_mutex_lock(&server.obj_freelist_mutex);
+        if (listLength(server.objfreelist) > REDIS_OBJFREELIST_MAX ||
+            !listAddNodeHead(server.objfreelist,o))
+            zfree(o);
+        pthread_mutex_unlock(&server.obj_freelist_mutex);
+        server.vm_stats_swapped_objects--;
+        return;
+    }
+    /* Object is in memory, or in the process of being swapped out. */
     if (--(o->refcount) == 0) {
+        if (server.vm_enabled && o->storage == REDIS_VM_SWAPPING)
+            vmCancelThreadedIOJob(obj);
         switch(o->type) {
         case REDIS_STRING: freeStringObject(o); break;
         case REDIS_LIST: freeListObject(o); break;
@@ -2233,15 +2622,47 @@ static void decrRefCount(void *obj) {
         case REDIS_HASH: freeHashObject(o); break;
         default: redisAssert(0 != 0); break;
         }
+        if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
         if (listLength(server.objfreelist) > REDIS_OBJFREELIST_MAX ||
             !listAddNodeHead(server.objfreelist,o))
             zfree(o);
+        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
     }
 }
 
 static robj *lookupKey(redisDb *db, robj *key) {
     dictEntry *de = dictFind(db->dict,key);
-    return de ? dictGetEntryVal(de) : NULL;
+    if (de) {
+        robj *key = dictGetEntryKey(de);
+        robj *val = dictGetEntryVal(de);
+
+        if (server.vm_enabled) {
+            if (key->storage == REDIS_VM_MEMORY ||
+                key->storage == REDIS_VM_SWAPPING)
+            {
+                /* If we were swapping the object out, stop it, this key
+                 * was requested. */
+                if (key->storage == REDIS_VM_SWAPPING)
+                    vmCancelThreadedIOJob(key);
+                /* Update the access time of the key for the aging algorithm. */
+                key->vm.atime = server.unixtime;
+            } else {
+                int notify = (key->storage == REDIS_VM_LOADING);
+
+                /* Our value was swapped on disk. Bring it at home. */
+                redisAssert(val == NULL);
+                val = vmLoadObject(key);
+                dictGetEntryVal(de) = val;
+
+                /* Clients blocked by the VM subsystem may be waiting for
+                 * this key... */
+                if (notify) handleClientsBlockedOnSwappedKey(db,key);
+            }
+        }
+        return val;
+    } else {
+        return NULL;
+    }
 }
 
 static robj *lookupKeyRead(redisDb *db, robj *key) {
@@ -2424,7 +2845,7 @@ static size_t stringObjectLen(robj *o) {
     }
 }
 
-/*============================ DB saving/loading ============================ */
+/*============================ RDB saving/loading =========================== */
 
 static int rdbSaveType(FILE *fp, unsigned char type) {
     if (fwrite(&type,1,1,fp) == 0) return -1;
@@ -2564,9 +2985,18 @@ static int rdbSaveStringObjectRaw(FILE *fp, robj *obj) {
 static int rdbSaveStringObject(FILE *fp, robj *obj) {
     int retval;
 
-    obj = getDecodedObject(obj);
-    retval = rdbSaveStringObjectRaw(fp,obj);
-    decrRefCount(obj);
+    /* Avoid incr/decr ref count business when possible.
+     * This plays well with copy-on-write given that we are probably
+     * in a child process (BGSAVE). Also this makes sure key objects
+     * of swapped objects are not incRefCount-ed (an assert does not allow
+     * this in order to avoid bugs) */
+    if (obj->encoding != REDIS_ENCODING_RAW) {
+        obj = getDecodedObject(obj);
+        retval = rdbSaveStringObjectRaw(fp,obj);
+        decrRefCount(obj);
+    } else {
+        retval = rdbSaveStringObjectRaw(fp,obj);
+    }
     return retval;
 }
 
@@ -2597,6 +3027,76 @@ static int rdbSaveDoubleValue(FILE *fp, double val) {
     return 0;
 }
 
+/* Save a Redis object. */
+static int rdbSaveObject(FILE *fp, robj *o) {
+    if (o->type == REDIS_STRING) {
+        /* Save a string value */
+        if (rdbSaveStringObject(fp,o) == -1) return -1;
+    } else if (o->type == REDIS_LIST) {
+        /* Save a list value */
+        list *list = o->ptr;
+        listIter li;
+        listNode *ln;
+
+        if (rdbSaveLen(fp,listLength(list)) == -1) return -1;
+        listRewind(list,&li);
+        while((ln = listNext(&li))) {
+            robj *eleobj = listNodeValue(ln);
+
+            if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
+        }
+    } else if (o->type == REDIS_SET) {
+        /* Save a set value */
+        dict *set = o->ptr;
+        dictIterator *di = dictGetIterator(set);
+        dictEntry *de;
+
+        if (rdbSaveLen(fp,dictSize(set)) == -1) return -1;
+        while((de = dictNext(di)) != NULL) {
+            robj *eleobj = dictGetEntryKey(de);
+
+            if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
+        }
+        dictReleaseIterator(di);
+    } else if (o->type == REDIS_ZSET) {
+        /* Save a set value */
+        zset *zs = o->ptr;
+        dictIterator *di = dictGetIterator(zs->dict);
+        dictEntry *de;
+
+        if (rdbSaveLen(fp,dictSize(zs->dict)) == -1) return -1;
+        while((de = dictNext(di)) != NULL) {
+            robj *eleobj = dictGetEntryKey(de);
+            double *score = dictGetEntryVal(de);
+
+            if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
+            if (rdbSaveDoubleValue(fp,*score) == -1) return -1;
+        }
+        dictReleaseIterator(di);
+    } else {
+        redisAssert(0 != 0);
+    }
+    return 0;
+}
+
+/* Return the length the object will have on disk if saved with
+ * the rdbSaveObject() function. Currently we use a trick to get
+ * this length with very little changes to the code. In the future
+ * we could switch to a faster solution. */
+static off_t rdbSavedObjectLen(robj *o, FILE *fp) {
+    if (fp == NULL) fp = server.devnull;
+    rewind(fp);
+    assert(rdbSaveObject(fp,o) != 1);
+    return ftello(fp);
+}
+
+/* Return the number of pages required to save this object in the swap file */
+static off_t rdbSavedObjectPages(robj *o, FILE *fp) {
+    off_t bytes = rdbSavedObjectLen(o,fp);
+    
+    return (bytes+(server.vm_page_size-1))/server.vm_page_size;
+}
+
 /* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
 static int rdbSave(char *filename) {
     dictIterator *di = NULL;
@@ -2605,6 +3105,12 @@ static int rdbSave(char *filename) {
     char tmpfile[256];
     int j;
     time_t now = time(NULL);
+
+    /* Wait for I/O therads to terminate, just in case this is a
+     * foreground-saving, to avoid seeking the swap file descriptor at the
+     * same time. */
+    if (server.vm_enabled)
+        waitEmptyIOJobsQueue();
 
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
     fp = fopen(tmpfile,"w");
@@ -2640,54 +3146,25 @@ static int rdbSave(char *filename) {
                 if (rdbSaveType(fp,REDIS_EXPIRETIME) == -1) goto werr;
                 if (rdbSaveTime(fp,expiretime) == -1) goto werr;
             }
-            /* Save the key and associated value */
-            if (rdbSaveType(fp,o->type) == -1) goto werr;
-            if (rdbSaveStringObject(fp,key) == -1) goto werr;
-            if (o->type == REDIS_STRING) {
-                /* Save a string value */
-                if (rdbSaveStringObject(fp,o) == -1) goto werr;
-            } else if (o->type == REDIS_LIST) {
-                /* Save a list value */
-                list *list = o->ptr;
-                listNode *ln;
-
-                listRewind(list);
-                if (rdbSaveLen(fp,listLength(list)) == -1) goto werr;
-                while((ln = listYield(list))) {
-                    robj *eleobj = listNodeValue(ln);
-
-                    if (rdbSaveStringObject(fp,eleobj) == -1) goto werr;
-                }
-            } else if (o->type == REDIS_SET) {
-                /* Save a set value */
-                dict *set = o->ptr;
-                dictIterator *di = dictGetIterator(set);
-                dictEntry *de;
-
-                if (rdbSaveLen(fp,dictSize(set)) == -1) goto werr;
-                while((de = dictNext(di)) != NULL) {
-                    robj *eleobj = dictGetEntryKey(de);
-
-                    if (rdbSaveStringObject(fp,eleobj) == -1) goto werr;
-                }
-                dictReleaseIterator(di);
-            } else if (o->type == REDIS_ZSET) {
-                /* Save a set value */
-                zset *zs = o->ptr;
-                dictIterator *di = dictGetIterator(zs->dict);
-                dictEntry *de;
-
-                if (rdbSaveLen(fp,dictSize(zs->dict)) == -1) goto werr;
-                while((de = dictNext(di)) != NULL) {
-                    robj *eleobj = dictGetEntryKey(de);
-                    double *score = dictGetEntryVal(de);
-
-                    if (rdbSaveStringObject(fp,eleobj) == -1) goto werr;
-                    if (rdbSaveDoubleValue(fp,*score) == -1) goto werr;
-                }
-                dictReleaseIterator(di);
+            /* Save the key and associated value. This requires special
+             * handling if the value is swapped out. */
+            if (!server.vm_enabled || key->storage == REDIS_VM_MEMORY ||
+                                      key->storage == REDIS_VM_SWAPPING) {
+                /* Save type, key, value */
+                if (rdbSaveType(fp,o->type) == -1) goto werr;
+                if (rdbSaveStringObject(fp,key) == -1) goto werr;
+                if (rdbSaveObject(fp,o) == -1) goto werr;
             } else {
-                redisAssert(0 != 0);
+                /* REDIS_VM_SWAPPED or REDIS_VM_LOADING */
+                robj *po;
+                /* Get a preview of the object in memory */
+                po = vmPreviewObject(key);
+                /* Save type, key, value */
+                if (rdbSaveType(fp,key->vtype) == -1) goto werr;
+                if (rdbSaveStringObject(fp,key) == -1) goto werr;
+                if (rdbSaveObject(fp,po) == -1) goto werr;
+                /* Remove the loaded object from memory */
+                decrRefCount(po);
             }
         }
         dictReleaseIterator(di);
@@ -2724,13 +3201,15 @@ static int rdbSaveBackground(char *filename) {
     pid_t childpid;
 
     if (server.bgsavechildpid != -1) return REDIS_ERR;
+    if (server.vm_enabled) waitEmptyIOJobsQueue();
     if ((childpid = fork()) == 0) {
         /* Child */
+        if (server.vm_enabled) vmReopenSwapFile();
         close(server.fd);
         if (rdbSave(filename) == REDIS_OK) {
-            exit(0);
+            _exit(0);
         } else {
-            exit(1);
+            _exit(1);
         }
     } else {
         /* Parent */
@@ -2770,35 +3249,29 @@ static time_t rdbLoadTime(FILE *fp) {
  *
  * isencoded is set to 1 if the readed length is not actually a length but
  * an "encoding type", check the above comments for more info */
-static uint32_t rdbLoadLen(FILE *fp, int rdbver, int *isencoded) {
+static uint32_t rdbLoadLen(FILE *fp, int *isencoded) {
     unsigned char buf[2];
     uint32_t len;
+    int type;
 
     if (isencoded) *isencoded = 0;
-    if (rdbver == 0) {
+    if (fread(buf,1,1,fp) == 0) return REDIS_RDB_LENERR;
+    type = (buf[0]&0xC0)>>6;
+    if (type == REDIS_RDB_6BITLEN) {
+        /* Read a 6 bit len */
+        return buf[0]&0x3F;
+    } else if (type == REDIS_RDB_ENCVAL) {
+        /* Read a 6 bit len encoding type */
+        if (isencoded) *isencoded = 1;
+        return buf[0]&0x3F;
+    } else if (type == REDIS_RDB_14BITLEN) {
+        /* Read a 14 bit len */
+        if (fread(buf+1,1,1,fp) == 0) return REDIS_RDB_LENERR;
+        return ((buf[0]&0x3F)<<8)|buf[1];
+    } else {
+        /* Read a 32 bit len */
         if (fread(&len,4,1,fp) == 0) return REDIS_RDB_LENERR;
         return ntohl(len);
-    } else {
-        int type;
-
-        if (fread(buf,1,1,fp) == 0) return REDIS_RDB_LENERR;
-        type = (buf[0]&0xC0)>>6;
-        if (type == REDIS_RDB_6BITLEN) {
-            /* Read a 6 bit len */
-            return buf[0]&0x3F;
-        } else if (type == REDIS_RDB_ENCVAL) {
-            /* Read a 6 bit len encoding type */
-            if (isencoded) *isencoded = 1;
-            return buf[0]&0x3F;
-        } else if (type == REDIS_RDB_14BITLEN) {
-            /* Read a 14 bit len */
-            if (fread(buf+1,1,1,fp) == 0) return REDIS_RDB_LENERR;
-            return ((buf[0]&0x3F)<<8)|buf[1];
-        } else {
-            /* Read a 32 bit len */
-            if (fread(&len,4,1,fp) == 0) return REDIS_RDB_LENERR;
-            return ntohl(len);
-        }
     }
 }
 
@@ -2826,13 +3299,13 @@ static robj *rdbLoadIntegerObject(FILE *fp, int enctype) {
     return createObject(REDIS_STRING,sdscatprintf(sdsempty(),"%lld",val));
 }
 
-static robj *rdbLoadLzfStringObject(FILE*fp, int rdbver) {
+static robj *rdbLoadLzfStringObject(FILE*fp) {
     unsigned int len, clen;
     unsigned char *c = NULL;
     sds val = NULL;
 
-    if ((clen = rdbLoadLen(fp,rdbver,NULL)) == REDIS_RDB_LENERR) return NULL;
-    if ((len = rdbLoadLen(fp,rdbver,NULL)) == REDIS_RDB_LENERR) return NULL;
+    if ((clen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+    if ((len = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
     if ((c = zmalloc(clen)) == NULL) goto err;
     if ((val = sdsnewlen(NULL,len)) == NULL) goto err;
     if (fread(c,clen,1,fp) == 0) goto err;
@@ -2845,12 +3318,12 @@ err:
     return NULL;
 }
 
-static robj *rdbLoadStringObject(FILE*fp, int rdbver) {
+static robj *rdbLoadStringObject(FILE*fp) {
     int isencoded;
     uint32_t len;
     sds val;
 
-    len = rdbLoadLen(fp,rdbver,&isencoded);
+    len = rdbLoadLen(fp,&isencoded);
     if (isencoded) {
         switch(len) {
         case REDIS_RDB_ENC_INT8:
@@ -2858,7 +3331,7 @@ static robj *rdbLoadStringObject(FILE*fp, int rdbver) {
         case REDIS_RDB_ENC_INT32:
             return tryObjectSharing(rdbLoadIntegerObject(fp,len));
         case REDIS_RDB_ENC_LZF:
-            return tryObjectSharing(rdbLoadLzfStringObject(fp,rdbver));
+            return tryObjectSharing(rdbLoadLzfStringObject(fp));
         default:
             redisAssert(0!=0);
         }
@@ -2891,6 +3364,63 @@ static int rdbLoadDoubleValue(FILE *fp, double *val) {
     }
 }
 
+/* Load a Redis object of the specified type from the specified file.
+ * On success a newly allocated object is returned, otherwise NULL. */
+static robj *rdbLoadObject(int type, FILE *fp) {
+    robj *o;
+
+    if (type == REDIS_STRING) {
+        /* Read string value */
+        if ((o = rdbLoadStringObject(fp)) == NULL) return NULL;
+        tryObjectEncoding(o);
+    } else if (type == REDIS_LIST || type == REDIS_SET) {
+        /* Read list/set value */
+        uint32_t listlen;
+
+        if ((listlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+        o = (type == REDIS_LIST) ? createListObject() : createSetObject();
+        /* It's faster to expand the dict to the right size asap in order
+         * to avoid rehashing */
+        if (type == REDIS_SET && listlen > DICT_HT_INITIAL_SIZE)
+            dictExpand(o->ptr,listlen);
+        /* Load every single element of the list/set */
+        while(listlen--) {
+            robj *ele;
+
+            if ((ele = rdbLoadStringObject(fp)) == NULL) return NULL;
+            tryObjectEncoding(ele);
+            if (type == REDIS_LIST) {
+                listAddNodeTail((list*)o->ptr,ele);
+            } else {
+                dictAdd((dict*)o->ptr,ele,NULL);
+            }
+        }
+    } else if (type == REDIS_ZSET) {
+        /* Read list/set value */
+        uint32_t zsetlen;
+        zset *zs;
+
+        if ((zsetlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+        o = createZsetObject();
+        zs = o->ptr;
+        /* Load every single element of the list/set */
+        while(zsetlen--) {
+            robj *ele;
+            double *score = zmalloc(sizeof(double));
+
+            if ((ele = rdbLoadStringObject(fp)) == NULL) return NULL;
+            tryObjectEncoding(ele);
+            if (rdbLoadDoubleValue(fp,score) == -1) return NULL;
+            dictAdd(zs->dict,ele,score);
+            zslInsert(zs->zsl,*score,ele);
+            incrRefCount(ele); /* added to skiplist */
+        }
+    } else {
+        redisAssert(0 != 0);
+    }
+    return o;
+}
+
 static int rdbLoad(char *filename) {
     FILE *fp;
     robj *keyobj = NULL;
@@ -2900,6 +3430,7 @@ static int rdbLoad(char *filename) {
     redisDb *db = server.db+0;
     char buf[1024];
     time_t expiretime = -1, now = time(NULL);
+    long long loadedkeys = 0;
 
     fp = fopen(filename,"r");
     if (!fp) return REDIS_ERR;
@@ -2911,7 +3442,7 @@ static int rdbLoad(char *filename) {
         return REDIS_ERR;
     }
     rdbver = atoi(buf+5);
-    if (rdbver > 1) {
+    if (rdbver != 1) {
         fclose(fp);
         redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
         return REDIS_ERR;
@@ -2929,7 +3460,7 @@ static int rdbLoad(char *filename) {
         if (type == REDIS_EOF) break;
         /* Handle SELECT DB opcode as a special case */
         if (type == REDIS_SELECTDB) {
-            if ((dbid = rdbLoadLen(fp,rdbver,NULL)) == REDIS_RDB_LENERR)
+            if ((dbid = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR)
                 goto eoferr;
             if (dbid >= (unsigned)server.dbnum) {
                 redisLog(REDIS_WARNING,"FATAL: Data file was created with a Redis server configured to handle more than %d databases. Exiting\n", server.dbnum);
@@ -2940,55 +3471,9 @@ static int rdbLoad(char *filename) {
             continue;
         }
         /* Read key */
-        if ((keyobj = rdbLoadStringObject(fp,rdbver)) == NULL) goto eoferr;
-
-        if (type == REDIS_STRING) {
-            /* Read string value */
-            if ((o = rdbLoadStringObject(fp,rdbver)) == NULL) goto eoferr;
-            tryObjectEncoding(o);
-        } else if (type == REDIS_LIST || type == REDIS_SET) {
-            /* Read list/set value */
-            uint32_t listlen;
-
-            if ((listlen = rdbLoadLen(fp,rdbver,NULL)) == REDIS_RDB_LENERR)
-                goto eoferr;
-            o = (type == REDIS_LIST) ? createListObject() : createSetObject();
-            /* Load every single element of the list/set */
-            while(listlen--) {
-                robj *ele;
-
-                if ((ele = rdbLoadStringObject(fp,rdbver)) == NULL) goto eoferr;
-                tryObjectEncoding(ele);
-                if (type == REDIS_LIST) {
-                    listAddNodeTail((list*)o->ptr,ele);
-                } else {
-                    dictAdd((dict*)o->ptr,ele,NULL);
-                }
-            }
-        } else if (type == REDIS_ZSET) {
-            /* Read list/set value */
-            uint32_t zsetlen;
-            zset *zs;
-
-            if ((zsetlen = rdbLoadLen(fp,rdbver,NULL)) == REDIS_RDB_LENERR)
-                goto eoferr;
-            o = createZsetObject();
-            zs = o->ptr;
-            /* Load every single element of the list/set */
-            while(zsetlen--) {
-                robj *ele;
-                double *score = zmalloc(sizeof(double));
-
-                if ((ele = rdbLoadStringObject(fp,rdbver)) == NULL) goto eoferr;
-                tryObjectEncoding(ele);
-                if (rdbLoadDoubleValue(fp,score) == -1) goto eoferr;
-                dictAdd(zs->dict,ele,score);
-                zslInsert(zs->zsl,*score,ele);
-                incrRefCount(ele); /* added to skiplist */
-            }
-        } else {
-            redisAssert(0 != 0);
-        }
+        if ((keyobj = rdbLoadStringObject(fp)) == NULL) goto eoferr;
+        /* Read value */
+        if ((o = rdbLoadObject(type,fp)) == NULL) goto eoferr;
         /* Add the new object in the hash table */
         retval = dictAdd(d,keyobj,o);
         if (retval == DICT_ERR) {
@@ -3003,6 +3488,13 @@ static int rdbLoad(char *filename) {
             expiretime = -1;
         }
         keyobj = o = NULL;
+        /* Handle swapping while loading big datasets when VM is on */
+        loadedkeys++;
+        if (server.vm_enabled && (loadedkeys % 5000) == 0) {
+            while (zmalloc_used_memory() > server.vm_max_memory) {
+                if (vmSwapOneObjectBlocking() == REDIS_ERR) break;
+            }
+        }
     }
     fclose(fp);
     return REDIS_OK;
@@ -3045,6 +3537,12 @@ static void setGenericCommand(redisClient *c, int nx) {
     retval = dictAdd(c->db->dict,c->argv[1],c->argv[2]);
     if (retval == DICT_ERR) {
         if (!nx) {
+            /* If the key is about a swapped value, we want a new key object
+             * to overwrite the old. So we delete the old key in the database.
+             * This will also make sure that swap pages about the old object
+             * will be marked as free. */
+            if (deleteIfSwapped(c->db,c->argv[1]))
+                incrRefCount(c->argv[1]);
             dictReplace(c->db->dict,c->argv[1],c->argv[2]);
             incrRefCount(c->argv[2]);
         } else {
@@ -3227,6 +3725,52 @@ static void decrbyCommand(redisClient *c) {
     incrDecrCommand(c,-incr);
 }
 
+static void appendCommand(redisClient *c) {
+    int retval;
+    size_t totlen;
+    robj *o;
+
+    o = lookupKeyWrite(c->db,c->argv[1]);
+    if (o == NULL) {
+        /* Create the key */
+        retval = dictAdd(c->db->dict,c->argv[1],c->argv[2]);
+        incrRefCount(c->argv[1]);
+        incrRefCount(c->argv[2]);
+        totlen = stringObjectLen(c->argv[2]);
+    } else {
+        dictEntry *de;
+       
+        de = dictFind(c->db->dict,c->argv[1]);
+        assert(de != NULL);
+
+        o = dictGetEntryVal(de);
+        if (o->type != REDIS_STRING) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+        /* If the object is specially encoded or shared we have to make
+         * a copy */
+        if (o->refcount != 1 || o->encoding != REDIS_ENCODING_RAW) {
+            robj *decoded = getDecodedObject(o);
+
+            o = createStringObject(decoded->ptr, sdslen(decoded->ptr));
+            decrRefCount(decoded);
+            dictReplace(c->db->dict,c->argv[1],o);
+        }
+        /* APPEND! */
+        if (c->argv[2]->encoding == REDIS_ENCODING_RAW) {
+            o->ptr = sdscatlen(o->ptr,
+                c->argv[2]->ptr, sdslen(c->argv[2]->ptr));
+        } else {
+            o->ptr = sdscatprintf(o->ptr, "%ld",
+                (unsigned long) c->argv[2]->ptr);
+        }
+        totlen = sdslen(o->ptr);
+    }
+    server.dirty++;
+    addReplySds(c,sdscatprintf(sdsempty(),":%lu\r\n",(unsigned long)totlen));
+}
+
 /* ========================= Type agnostic commands ========================= */
 
 static void delCommand(redisClient *c) {
@@ -3381,6 +3925,7 @@ static void shutdownCommand(redisClient *c) {
     if (server.appendonly) {
         /* Append only file: fsync() the AOF and exit */
         fsync(server.appendfd);
+        if (server.vm_enabled) unlink(server.vm_swap_file);
         exit(0);
     } else {
         /* Snapshotting. Perform a SYNC SAVE and exit */
@@ -3389,6 +3934,7 @@ static void shutdownCommand(redisClient *c) {
                 unlink(server.pidfile);
             redisLog(REDIS_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
             redisLog(REDIS_WARNING,"Server exit now, bye bye...");
+            if (server.vm_enabled) unlink(server.vm_swap_file);
             exit(0);
         } else {
             /* Ooops.. error saving! The best we can do is to continue operating.
@@ -3491,6 +4037,10 @@ static void pushGenericCommand(redisClient *c, int where) {
 
     lobj = lookupKeyWrite(c->db,c->argv[1]);
     if (lobj == NULL) {
+        if (handleClientsWaitingListPush(c,c->argv[1],c->argv[2])) {
+            addReply(c,shared.ok);
+            return;
+        }
         lobj = createListObject();
         list = lobj->ptr;
         if (where == REDIS_HEAD) {
@@ -3504,6 +4054,10 @@ static void pushGenericCommand(redisClient *c, int where) {
     } else {
         if (lobj->type != REDIS_LIST) {
             addReply(c,shared.wrongtypeerr);
+            return;
+        }
+        if (handleClientsWaitingListPush(c,c->argv[1],c->argv[2])) {
+            addReply(c,shared.ok);
             return;
         }
         list = lobj->ptr;
@@ -3810,20 +4364,24 @@ static void rpoplpushcommand(redisClient *c) {
                 robj *ele = listNodeValue(ln);
                 list *dstlist;
 
-                if (dobj == NULL) {
-
-                    /* Create the list if the key does not exist */
-                    dobj = createListObject();
-                    dictAdd(c->db->dict,c->argv[2],dobj);
-                    incrRefCount(c->argv[2]);
-                } else if (dobj->type != REDIS_LIST) {
+                if (dobj && dobj->type != REDIS_LIST) {
                     addReply(c,shared.wrongtypeerr);
                     return;
                 }
-                /* Add the element to the target list */
-                dstlist = dobj->ptr;
-                listAddNodeHead(dstlist,ele);
-                incrRefCount(ele);
+
+                /* Add the element to the target list (unless it's directly
+                 * passed to some BLPOP-ing client */
+                if (!handleClientsWaitingListPush(c,c->argv[2],ele)) {
+                    if (dobj == NULL) {
+                        /* Create the list if the key does not exist */
+                        dobj = createListObject();
+                        dictAdd(c->db->dict,c->argv[2],dobj);
+                        incrRefCount(c->argv[2]);
+                    }
+                    dstlist = dobj->ptr;
+                    listAddNodeHead(dstlist,ele);
+                    incrRefCount(ele);
+                }
 
                 /* Send the element to the client as reply as well */
                 addReplyBulkLen(c,ele);
@@ -4668,28 +5226,64 @@ static void zrevrangeCommand(redisClient *c) {
     zrangeGenericCommand(c,1);
 }
 
-static void zrangebyscoreCommand(redisClient *c) {
+/* This command implements both ZRANGEBYSCORE and ZCOUNT.
+ * If justcount is non-zero, just the count is returned. */
+static void genericZrangebyscoreCommand(redisClient *c, int justcount) {
     robj *o;
-    double min = strtod(c->argv[2]->ptr,NULL);
-    double max = strtod(c->argv[3]->ptr,NULL);
+    double min, max;
+    int minex = 0, maxex = 0; /* are min or max exclusive? */
     int offset = 0, limit = -1;
+    int withscores = 0;
+    int badsyntax = 0;
 
-    if (c->argc != 4 && c->argc != 7) {
+    /* Parse the min-max interval. If one of the values is prefixed
+     * by the "(" character, it's considered "open". For instance
+     * ZRANGEBYSCORE zset (1.5 (2.5 will match min < x < max
+     * ZRANGEBYSCORE zset 1.5 2.5 will instead match min <= x <= max */
+    if (((char*)c->argv[2]->ptr)[0] == '(') {
+        min = strtod((char*)c->argv[2]->ptr+1,NULL);
+        minex = 1;
+    } else {
+        min = strtod(c->argv[2]->ptr,NULL);
+    }
+    if (((char*)c->argv[3]->ptr)[0] == '(') {
+        max = strtod((char*)c->argv[3]->ptr+1,NULL);
+        maxex = 1;
+    } else {
+        max = strtod(c->argv[3]->ptr,NULL);
+    }
+
+    /* Parse "WITHSCORES": note that if the command was called with
+     * the name ZCOUNT then we are sure that c->argc == 4, so we'll never
+     * enter the following paths to parse WITHSCORES and LIMIT. */
+    if (c->argc == 5 || c->argc == 8) {
+        if (strcasecmp(c->argv[c->argc-1]->ptr,"withscores") == 0)
+            withscores = 1;
+        else
+            badsyntax = 1;
+    }
+    if (c->argc != (4 + withscores) && c->argc != (7 + withscores))
+        badsyntax = 1;
+    if (badsyntax) {
         addReplySds(c,
             sdsnew("-ERR wrong number of arguments for ZRANGEBYSCORE\r\n"));
         return;
-    } else if (c->argc == 7 && strcasecmp(c->argv[4]->ptr,"limit")) {
+    }
+
+    /* Parse "LIMIT" */
+    if (c->argc == (7 + withscores) && strcasecmp(c->argv[4]->ptr,"limit")) {
         addReply(c,shared.syntaxerr);
         return;
-    } else if (c->argc == 7) {
+    } else if (c->argc == (7 + withscores)) {
         offset = atoi(c->argv[5]->ptr);
         limit = atoi(c->argv[6]->ptr);
         if (offset < 0) offset = 0;
     }
 
+    /* Ok, lookup the key and get the range */
     o = lookupKeyRead(c->db,c->argv[1]);
     if (o == NULL) {
-        addReply(c,shared.nullmultibulk);
+        addReply(c,justcount ? shared.czero : shared.nullmultibulk);
     } else {
         if (o->type != REDIS_ZSET) {
             addReply(c,shared.wrongtypeerr);
@@ -4697,14 +5291,17 @@ static void zrangebyscoreCommand(redisClient *c) {
             zset *zsetobj = o->ptr;
             zskiplist *zsl = zsetobj->zsl;
             zskiplistNode *ln;
-            robj *ele, *lenobj;
-            unsigned int rangelen = 0;
+            robj *ele, *lenobj = NULL;
+            unsigned long rangelen = 0;
 
-            /* Get the first node with the score >= min */
+            /* Get the first node with the score >= min, or with
+             * score > min if 'minex' is true. */
             ln = zslFirstWithScore(zsl,min);
+            while (minex && ln && ln->score == min) ln = ln->forward[0];
+
             if (ln == NULL) {
                 /* No element matching the speciifed interval */
-                addReply(c,shared.emptymultibulk);
+                addReply(c,justcount ? shared.czero : shared.emptymultibulk);
                 return;
             }
 
@@ -4712,28 +5309,47 @@ static void zrangebyscoreCommand(redisClient *c) {
              * are in the list, so we push this object that will represent
              * the multi-bulk length in the output buffer, and will "fix"
              * it later */
-            lenobj = createObject(REDIS_STRING,NULL);
-            addReply(c,lenobj);
-            decrRefCount(lenobj);
+            if (!justcount) {
+                lenobj = createObject(REDIS_STRING,NULL);
+                addReply(c,lenobj);
+                decrRefCount(lenobj);
+            }
 
-            while(ln && ln->score <= max) {
+            while(ln && (maxex ? (ln->score < max) : (ln->score <= max))) {
                 if (offset) {
                     offset--;
                     ln = ln->forward[0];
                     continue;
                 }
                 if (limit == 0) break;
-                ele = ln->obj;
-                addReplyBulkLen(c,ele);
-                addReply(c,ele);
-                addReply(c,shared.crlf);
+                if (!justcount) {
+                    ele = ln->obj;
+                    addReplyBulkLen(c,ele);
+                    addReply(c,ele);
+                    addReply(c,shared.crlf);
+                    if (withscores)
+                        addReplyDouble(c,ln->score);
+                }
                 ln = ln->forward[0];
                 rangelen++;
                 if (limit > 0) limit--;
             }
-            lenobj->ptr = sdscatprintf(sdsempty(),"*%d\r\n",rangelen);
+            if (justcount) {
+                addReplyLong(c,(long)rangelen);
+            } else {
+                lenobj->ptr = sdscatprintf(sdsempty(),"*%lu\r\n",
+                     withscores ? (rangelen*2) : rangelen);
+            }
         }
     }
+}
+
+static void zrangebyscoreCommand(redisClient *c) {
+    genericZrangebyscoreCommand(c,0);
+}
+
+static void zcountCommand(redisClient *c) {
+    genericZrangebyscoreCommand(c,1);
 }
 
 static void zcardCommand(redisClient *c) {
@@ -5228,9 +5844,10 @@ static void sortCommand(redisClient *c) {
     if (sortval->type == REDIS_LIST) {
         list *list = sortval->ptr;
         listNode *ln;
+        listIter li;
 
-        listRewind(list);
-        while((ln = listYield(list))) {
+        listRewind(list,&li);
+        while((ln = listNext(&li))) {
             robj *ele = ln->value;
             vector[j].obj = ele;
             vector[j].u.score = 0;
@@ -5326,13 +5943,15 @@ static void sortCommand(redisClient *c) {
         addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",outputlen));
         for (j = start; j <= end; j++) {
             listNode *ln;
+            listIter li;
+
             if (!getop) {
                 addReplyBulkLen(c,vector[j].obj);
                 addReply(c,vector[j].obj);
                 addReply(c,shared.crlf);
             }
-            listRewind(operations);
-            while((ln = listYield(operations))) {
+            listRewind(operations,&li);
+            while((ln = listNext(&li))) {
                 redisSortOperation *sop = ln->value;
                 robj *val = lookupKeyByPattern(c->db,sop->pattern,
                     vector[j].obj);
@@ -5357,12 +5976,14 @@ static void sortCommand(redisClient *c) {
         /* STORE option specified, set the sorting result as a List object */
         for (j = start; j <= end; j++) {
             listNode *ln;
+            listIter li;
+
             if (!getop) {
                 listAddNodeTail(listPtr,vector[j].obj);
                 incrRefCount(vector[j].obj);
             }
-            listRewind(operations);
-            while((ln = listYield(operations))) {
+            listRewind(operations,&li);
+            while((ln = listNext(&li))) {
                 redisSortOperation *sop = ln->value;
                 robj *val = lookupKeyByPattern(c->db,sop->pattern,
                     vector[j].obj);
@@ -5399,6 +6020,27 @@ static void sortCommand(redisClient *c) {
     zfree(vector);
 }
 
+/* Convert an amount of bytes into a human readable string in the form
+ * of 100B, 2G, 100M, 4K, and so forth. */
+static void bytesToHuman(char *s, unsigned long long n) {
+    double d;
+
+    if (n < 1024) {
+        /* Bytes */
+        sprintf(s,"%lluB",n);
+        return;
+    } else if (n < (1024*1024)) {
+        d = (double)n/(1024);
+        sprintf(s,"%.2fK",d);
+    } else if (n < (1024LL*1024*1024)) {
+        d = (double)n/(1024*1024);
+        sprintf(s,"%.2fM",d);
+    } else if (n < (1024LL*1024*1024*1024)) {
+        d = (double)n/(1024LL*1024*1024);
+        sprintf(s,"%.2fG",d);
+    }
+}
+
 /* Create the string returned by the INFO command. This is decoupled
  * by the INFO command itself as we need to report the same information
  * on memory corruption problems. */
@@ -5406,37 +6048,47 @@ static sds genRedisInfoString(void) {
     sds info;
     time_t uptime = time(NULL)-server.stat_starttime;
     int j;
-    
+    char hmem[64];
+  
+    bytesToHuman(hmem,zmalloc_used_memory());
     info = sdscatprintf(sdsempty(),
         "redis_version:%s\r\n"
         "arch_bits:%s\r\n"
         "multiplexing_api:%s\r\n"
+        "process_id:%ld\r\n"
         "uptime_in_seconds:%ld\r\n"
         "uptime_in_days:%ld\r\n"
         "connected_clients:%d\r\n"
         "connected_slaves:%d\r\n"
+        "blocked_clients:%d\r\n"
         "used_memory:%zu\r\n"
+        "used_memory_human:%s\r\n"
         "changes_since_last_save:%lld\r\n"
         "bgsave_in_progress:%d\r\n"
         "last_save_time:%ld\r\n"
         "bgrewriteaof_in_progress:%d\r\n"
         "total_connections_received:%lld\r\n"
         "total_commands_processed:%lld\r\n"
+        "vm_enabled:%d\r\n"
         "role:%s\r\n"
         ,REDIS_VERSION,
         (sizeof(long) == 8) ? "64" : "32",
         aeGetApiName(),
+        (long) getpid(),
         uptime,
         uptime/(3600*24),
         listLength(server.clients)-listLength(server.slaves),
         listLength(server.slaves),
-        server.usedmemory,
+        server.blpop_blocked_clients,
+        zmalloc_used_memory(),
+        hmem,
         server.dirty,
         server.bgsavechildpid != -1,
         server.lastsave,
         server.bgrewritechildpid != -1,
         server.stat_numconnections,
         server.stat_numcommands,
+        server.vm_enabled != 0,
         server.masterhost == NULL ? "master" : "slave"
     );
     if (server.masterhost) {
@@ -5451,6 +6103,36 @@ static sds genRedisInfoString(void) {
                 "up" : "down",
             server.master ? ((int)(time(NULL)-server.master->lastinteraction)) : -1
         );
+    }
+    if (server.vm_enabled) {
+        lockThreadedIO();
+        info = sdscatprintf(info,
+            "vm_conf_max_memory:%llu\r\n"
+            "vm_conf_page_size:%llu\r\n"
+            "vm_conf_pages:%llu\r\n"
+            "vm_stats_used_pages:%llu\r\n"
+            "vm_stats_swapped_objects:%llu\r\n"
+            "vm_stats_swappin_count:%llu\r\n"
+            "vm_stats_swappout_count:%llu\r\n"
+            "vm_stats_io_newjobs_len:%lu\r\n"
+            "vm_stats_io_processing_len:%lu\r\n"
+            "vm_stats_io_processed_len:%lu\r\n"
+            "vm_stats_io_active_threads:%lu\r\n"
+            "vm_stats_blocked_clients:%lu\r\n"
+            ,(unsigned long long) server.vm_max_memory,
+            (unsigned long long) server.vm_page_size,
+            (unsigned long long) server.vm_pages,
+            (unsigned long long) server.vm_stats_used_pages,
+            (unsigned long long) server.vm_stats_swapped_objects,
+            (unsigned long long) server.vm_stats_swapins,
+            (unsigned long long) server.vm_stats_swapouts,
+            (unsigned long) listLength(server.io_newjobs),
+            (unsigned long) listLength(server.io_processing),
+            (unsigned long) listLength(server.io_processed),
+            (unsigned long) server.io_active_threads,
+            (unsigned long) server.vm_blocked_clients
+        );
+        unlockThreadedIO();
     }
     for (j = 0; j < server.dbnum; j++) {
         long long keys, vkeys;
@@ -5657,6 +6339,207 @@ static void execCommand(redisClient *c) {
     c->flags &= (~REDIS_MULTI);
 }
 
+/* =========================== Blocking Operations  ========================= */
+
+/* Currently Redis blocking operations support is limited to list POP ops,
+ * so the current implementation is not fully generic, but it is also not
+ * completely specific so it will not require a rewrite to support new
+ * kind of blocking operations in the future.
+ *
+ * Still it's important to note that list blocking operations can be already
+ * used as a notification mechanism in order to implement other blocking
+ * operations at application level, so there must be a very strong evidence
+ * of usefulness and generality before new blocking operations are implemented.
+ *
+ * This is how the current blocking POP works, we use BLPOP as example:
+ * - If the user calls BLPOP and the key exists and contains a non empty list
+ *   then LPOP is called instead. So BLPOP is semantically the same as LPOP
+ *   if there is not to block.
+ * - If instead BLPOP is called and the key does not exists or the list is
+ *   empty we need to block. In order to do so we remove the notification for
+ *   new data to read in the client socket (so that we'll not serve new
+ *   requests if the blocking request is not served). Also we put the client
+ *   in a dictionary (db->blockingkeys) mapping keys to a list of clients
+ *   blocking for this keys.
+ * - If a PUSH operation against a key with blocked clients waiting is
+ *   performed, we serve the first in the list: basically instead to push
+ *   the new element inside the list we return it to the (first / oldest)
+ *   blocking client, unblock the client, and remove it form the list.
+ *
+ * The above comment and the source code should be enough in order to understand
+ * the implementation and modify / fix it later.
+ */
+
+/* Set a client in blocking mode for the specified key, with the specified
+ * timeout */
+static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeout) {
+    dictEntry *de;
+    list *l;
+    int j;
+
+    c->blockingkeys = zmalloc(sizeof(robj*)*numkeys);
+    c->blockingkeysnum = numkeys;
+    c->blockingto = timeout;
+    for (j = 0; j < numkeys; j++) {
+        /* Add the key in the client structure, to map clients -> keys */
+        c->blockingkeys[j] = keys[j];
+        incrRefCount(keys[j]);
+
+        /* And in the other "side", to map keys -> clients */
+        de = dictFind(c->db->blockingkeys,keys[j]);
+        if (de == NULL) {
+            int retval;
+
+            /* For every key we take a list of clients blocked for it */
+            l = listCreate();
+            retval = dictAdd(c->db->blockingkeys,keys[j],l);
+            incrRefCount(keys[j]);
+            assert(retval == DICT_OK);
+        } else {
+            l = dictGetEntryVal(de);
+        }
+        listAddNodeTail(l,c);
+    }
+    /* Mark the client as a blocked client */
+    c->flags |= REDIS_BLOCKED;
+    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+    server.blpop_blocked_clients++;
+}
+
+/* Unblock a client that's waiting in a blocking operation such as BLPOP */
+static void unblockClientWaitingData(redisClient *c) {
+    dictEntry *de;
+    list *l;
+    int j;
+
+    assert(c->blockingkeys != NULL);
+    /* The client may wait for multiple keys, so unblock it for every key. */
+    for (j = 0; j < c->blockingkeysnum; j++) {
+        /* Remove this client from the list of clients waiting for this key. */
+        de = dictFind(c->db->blockingkeys,c->blockingkeys[j]);
+        assert(de != NULL);
+        l = dictGetEntryVal(de);
+        listDelNode(l,listSearchKey(l,c));
+        /* If the list is empty we need to remove it to avoid wasting memory */
+        if (listLength(l) == 0)
+            dictDelete(c->db->blockingkeys,c->blockingkeys[j]);
+        decrRefCount(c->blockingkeys[j]);
+    }
+    /* Cleanup the client structure */
+    zfree(c->blockingkeys);
+    c->blockingkeys = NULL;
+    c->flags &= (~REDIS_BLOCKED);
+    server.blpop_blocked_clients--;
+    /* Ok now we are ready to get read events from socket, note that we
+     * can't trap errors here as it's possible that unblockClientWaitingDatas() is
+     * called from freeClient() itself, and the only thing we can do
+     * if we failed to register the READABLE event is to kill the client.
+     * Still the following function should never fail in the real world as
+     * we are sure the file descriptor is sane, and we exit on out of mem. */
+    aeCreateFileEvent(server.el, c->fd, AE_READABLE, readQueryFromClient, c);
+    /* As a final step we want to process data if there is some command waiting
+     * in the input buffer. Note that this is safe even if
+     * unblockClientWaitingData() gets called from freeClient() because
+     * freeClient() will be smart enough to call this function
+     * *after* c->querybuf was set to NULL. */
+    if (c->querybuf && sdslen(c->querybuf) > 0) processInputBuffer(c);
+}
+
+/* This should be called from any function PUSHing into lists.
+ * 'c' is the "pushing client", 'key' is the key it is pushing data against,
+ * 'ele' is the element pushed.
+ *
+ * If the function returns 0 there was no client waiting for a list push
+ * against this key.
+ *
+ * If the function returns 1 there was a client waiting for a list push
+ * against this key, the element was passed to this client thus it's not
+ * needed to actually add it to the list and the caller should return asap. */
+static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
+    struct dictEntry *de;
+    redisClient *receiver;
+    list *l;
+    listNode *ln;
+
+    de = dictFind(c->db->blockingkeys,key);
+    if (de == NULL) return 0;
+    l = dictGetEntryVal(de);
+    ln = listFirst(l);
+    assert(ln != NULL);
+    receiver = ln->value;
+
+    addReplySds(receiver,sdsnew("*2\r\n"));
+    addReplyBulkLen(receiver,key);
+    addReply(receiver,key);
+    addReply(receiver,shared.crlf);
+    addReplyBulkLen(receiver,ele);
+    addReply(receiver,ele);
+    addReply(receiver,shared.crlf);
+    unblockClientWaitingData(receiver);
+    return 1;
+}
+
+/* Blocking RPOP/LPOP */
+static void blockingPopGenericCommand(redisClient *c, int where) {
+    robj *o;
+    time_t timeout;
+    int j;
+
+    for (j = 1; j < c->argc-1; j++) {
+        o = lookupKeyWrite(c->db,c->argv[j]);
+        if (o != NULL) {
+            if (o->type != REDIS_LIST) {
+                addReply(c,shared.wrongtypeerr);
+                return;
+            } else {
+                list *list = o->ptr;
+                if (listLength(list) != 0) {
+                    /* If the list contains elements fall back to the usual
+                     * non-blocking POP operation */
+                    robj *argv[2], **orig_argv;
+                    int orig_argc;
+                   
+                    /* We need to alter the command arguments before to call
+                     * popGenericCommand() as the command takes a single key. */
+                    orig_argv = c->argv;
+                    orig_argc = c->argc;
+                    argv[1] = c->argv[j];
+                    c->argv = argv;
+                    c->argc = 2;
+
+                    /* Also the return value is different, we need to output
+                     * the multi bulk reply header and the key name. The
+                     * "real" command will add the last element (the value)
+                     * for us. If this souds like an hack to you it's just
+                     * because it is... */
+                    addReplySds(c,sdsnew("*2\r\n"));
+                    addReplyBulkLen(c,argv[1]);
+                    addReply(c,argv[1]);
+                    addReply(c,shared.crlf);
+                    popGenericCommand(c,where);
+
+                    /* Fix the client structure with the original stuff */
+                    c->argv = orig_argv;
+                    c->argc = orig_argc;
+                    return;
+                }
+            }
+        }
+    }
+    /* If the list is empty or the key does not exists we must block */
+    timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
+    if (timeout > 0) timeout += time(NULL);
+    blockForKeys(c,c->argv+1,c->argc-2,timeout);
+}
+
+static void blpopCommand(redisClient *c) {
+    blockingPopGenericCommand(c,REDIS_HEAD);
+}
+
+static void brpopCommand(redisClient *c) {
+    blockingPopGenericCommand(c,REDIS_TAIL);
+}
+
 /* =============================== Replication  ============================= */
 
 static int syncWrite(int fd, char *ptr, ssize_t size, int timeout) {
@@ -5743,9 +6626,10 @@ static void syncCommand(redisClient *c) {
          * registering differences since the server forked to save */
         redisClient *slave;
         listNode *ln;
+        listIter li;
 
-        listRewind(server.slaves);
-        while((ln = listYield(server.slaves))) {
+        listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
             slave = ln->value;
             if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END) break;
         }
@@ -5812,7 +6696,7 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         return;
     }
     if ((nwritten = write(fd,buf,buflen)) == -1) {
-        redisLog(REDIS_DEBUG,"Write error sending DB to slave: %s",
+        redisLog(REDIS_VERBOSE,"Write error sending DB to slave: %s",
             strerror(errno));
         freeClient(slave);
         return;
@@ -5842,9 +6726,10 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
 static void updateSlavesWaitingBgsave(int bgsaveerr) {
     listNode *ln;
     int startbgsave = 0;
+    listIter li;
 
-    listRewind(server.slaves);
-    while((ln = listYield(server.slaves))) {
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
         redisClient *slave = ln->value;
 
         if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START) {
@@ -5876,9 +6761,11 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
     }
     if (startbgsave) {
         if (rdbSaveBackground(server.dbfilename) != REDIS_OK) {
-            listRewind(server.slaves);
+            listIter li;
+
+            listRewind(server.slaves,&li);
             redisLog(REDIS_WARNING,"SYNC failed. BGSAVE failed");
-            while((ln = listYield(server.slaves))) {
+            while((ln = listNext(&li))) {
                 redisClient *slave = ln->value;
 
                 if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START)
@@ -6016,6 +6903,27 @@ static void slaveofCommand(redisClient *c) {
 
 /* ============================ Maxmemory directive  ======================== */
 
+/* Try to free one object form the pre-allocated objects free list.
+ * This is useful under low mem conditions as by default we take 1 million
+ * free objects allocated. On success REDIS_OK is returned, otherwise
+ * REDIS_ERR. */
+static int tryFreeOneObjectFromFreelist(void) {
+    robj *o;
+
+    if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
+    if (listLength(server.objfreelist)) {
+        listNode *head = listFirst(server.objfreelist);
+        o = listNodeValue(head);
+        listDelNode(server.objfreelist,head);
+        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
+        zfree(o);
+        return REDIS_OK;
+    } else {
+        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
+        return REDIS_ERR;
+    }
+}
+
 /* This function gets called when 'maxmemory' is set on the config file to limit
  * the max memory used by the server, and we are out of memory.
  * This function will try to, in order:
@@ -6029,40 +6937,32 @@ static void slaveofCommand(redisClient *c) {
  */
 static void freeMemoryIfNeeded(void) {
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
-        if (listLength(server.objfreelist)) {
-            robj *o;
+        int j, k, freed = 0;
 
-            listNode *head = listFirst(server.objfreelist);
-            o = listNodeValue(head);
-            listDelNode(server.objfreelist,head);
-            zfree(o);
-        } else {
-            int j, k, freed = 0;
+        if (tryFreeOneObjectFromFreelist() == REDIS_OK) continue;
+        for (j = 0; j < server.dbnum; j++) {
+            int minttl = -1;
+            robj *minkey = NULL;
+            struct dictEntry *de;
 
-            for (j = 0; j < server.dbnum; j++) {
-                int minttl = -1;
-                robj *minkey = NULL;
-                struct dictEntry *de;
+            if (dictSize(server.db[j].expires)) {
+                freed = 1;
+                /* From a sample of three keys drop the one nearest to
+                 * the natural expire */
+                for (k = 0; k < 3; k++) {
+                    time_t t;
 
-                if (dictSize(server.db[j].expires)) {
-                    freed = 1;
-                    /* From a sample of three keys drop the one nearest to
-                     * the natural expire */
-                    for (k = 0; k < 3; k++) {
-                        time_t t;
-
-                        de = dictGetRandomKey(server.db[j].expires);
-                        t = (time_t) dictGetEntryVal(de);
-                        if (minttl == -1 || t < minttl) {
-                            minkey = dictGetEntryKey(de);
-                            minttl = t;
-                        }
+                    de = dictGetRandomKey(server.db[j].expires);
+                    t = (time_t) dictGetEntryVal(de);
+                    if (minttl == -1 || t < minttl) {
+                        minkey = dictGetEntryKey(de);
+                        minttl = t;
                     }
-                    deleteKey(server.db+j,minkey);
                 }
+                deleteKey(server.db+j,minkey);
             }
-            if (!freed) return; /* nothing to free... */
         }
+        if (!freed) return; /* nothing to free... */
     }
 }
 
@@ -6186,6 +7086,7 @@ int loadAppendOnlyFile(char *filename) {
     struct redisClient *fakeClient;
     FILE *fp = fopen(filename,"r");
     struct redis_stat sb;
+    unsigned long long loadedkeys = 0;
 
     if (redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0)
         return REDIS_ERR;
@@ -6247,6 +7148,13 @@ int loadAppendOnlyFile(char *filename) {
         /* Clean up, ready for the next command */
         for (j = 0; j < argc; j++) decrRefCount(argv[j]);
         zfree(argv);
+        /* Handle swapping while loading big datasets when VM is on */
+        loadedkeys++;
+        if (server.vm_enabled && (loadedkeys % 5000) == 0) {
+            while (zmalloc_used_memory() > server.vm_max_memory) {
+                if (vmSwapOneObjectBlocking() == REDIS_ERR) break;
+            }
+        }
     }
     fclose(fp);
     freeFakeClient(fakeClient);
@@ -6267,16 +7175,26 @@ fmterr:
 /* Write an object into a file in the bulk format $<count>\r\n<payload>\r\n */
 static int fwriteBulk(FILE *fp, robj *obj) {
     char buf[128];
-    obj = getDecodedObject(obj);
+    int decrrc = 0;
+
+    /* Avoid the incr/decr ref count business if possible to help
+     * copy-on-write (we are often in a child process when this function
+     * is called).
+     * Also makes sure that key objects don't get incrRefCount-ed when VM
+     * is enabled */
+    if (obj->encoding != REDIS_ENCODING_RAW) {
+        obj = getDecodedObject(obj);
+        decrrc = 1;
+    }
     snprintf(buf,sizeof(buf),"$%ld\r\n",(long)sdslen(obj->ptr));
     if (fwrite(buf,strlen(buf),1,fp) == 0) goto err;
     if (sdslen(obj->ptr) && fwrite(obj->ptr,sdslen(obj->ptr),1,fp) == 0)
         goto err;
     if (fwrite("\r\n",2,1,fp) == 0) goto err;
-    decrRefCount(obj);
+    if (decrrc) decrRefCount(obj);
     return 1;
 err:
-    decrRefCount(obj);
+    if (decrrc) decrRefCount(obj);
     return 0;
 }
 
@@ -6337,9 +7255,24 @@ static int rewriteAppendOnlyFile(char *filename) {
 
         /* Iterate this DB writing every entry */
         while((de = dictNext(di)) != NULL) {
-            robj *key = dictGetEntryKey(de);
-            robj *o = dictGetEntryVal(de);
-            time_t expiretime = getExpire(db,key);
+            robj *key, *o;
+            time_t expiretime;
+            int swapped;
+
+            key = dictGetEntryKey(de);
+            /* If the value for this key is swapped, load a preview in memory.
+             * We use a "swapped" flag to remember if we need to free the
+             * value object instead to just increment the ref count anyway
+             * in order to avoid copy-on-write of pages if we are forked() */
+            if (!server.vm_enabled || key->storage == REDIS_VM_MEMORY ||
+                key->storage == REDIS_VM_SWAPPING) {
+                o = dictGetEntryVal(de);
+                swapped = 0;
+            } else {
+                o = vmPreviewObject(key);
+                swapped = 1;
+            }
+            expiretime = getExpire(db,key);
 
             /* Save the key and associated value */
             if (o->type == REDIS_STRING) {
@@ -6353,9 +7286,10 @@ static int rewriteAppendOnlyFile(char *filename) {
                 /* Emit the RPUSHes needed to rebuild the list */
                 list *list = o->ptr;
                 listNode *ln;
+                listIter li;
 
-                listRewind(list);
-                while((ln = listYield(list))) {
+                listRewind(list,&li);
+                while((ln = listNext(&li))) {
                     char cmd[]="*3\r\n$5\r\nRPUSH\r\n";
                     robj *eleobj = listNodeValue(ln);
 
@@ -6407,6 +7341,7 @@ static int rewriteAppendOnlyFile(char *filename) {
                 if (fwriteBulk(fp,key) == 0) goto werr;
                 if (fwriteBulkLong(fp,expiretime) == 0) goto werr;
             }
+            if (swapped) decrRefCount(o);
         }
         dictReleaseIterator(di);
     }
@@ -6450,16 +7385,18 @@ static int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (server.bgrewritechildpid != -1) return REDIS_ERR;
+    if (server.vm_enabled) waitEmptyIOJobsQueue();
     if ((childpid = fork()) == 0) {
         /* Child */
         char tmpfile[256];
-        close(server.fd);
 
+        if (server.vm_enabled) vmReopenSwapFile();
+        close(server.fd);
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) getpid());
         if (rewriteAppendOnlyFile(tmpfile) == REDIS_OK) {
-            exit(0);
+            _exit(0);
         } else {
-            exit(1);
+            _exit(1);
         }
     } else {
         /* Parent */
@@ -6502,6 +7439,1037 @@ static void aofRemoveTempFile(pid_t childpid) {
     unlink(tmpfile);
 }
 
+/* Virtual Memory is composed mainly of two subsystems:
+ * - Blocking Virutal Memory
+ * - Threaded Virtual Memory I/O
+ * The two parts are not fully decoupled, but functions are split among two
+ * different sections of the source code (delimited by comments) in order to
+ * make more clear what functionality is about the blocking VM and what about
+ * the threaded (not blocking) VM.
+ *
+ * Redis VM design:
+ *
+ * Redis VM is a blocking VM (one that blocks reading swapped values from
+ * disk into memory when a value swapped out is needed in memory) that is made
+ * unblocking by trying to examine the command argument vector in order to
+ * load in background values that will likely be needed in order to exec
+ * the command. The command is executed only once all the relevant keys
+ * are loaded into memory.
+ *
+ * This basically is almost as simple of a blocking VM, but almost as parallel
+ * as a fully non-blocking VM.
+ */
+
+/* =================== Virtual Memory - Blocking Side  ====================== */
+
+/* substitute the first occurrence of '%p' with the process pid in the
+ * swap file name. */
+static void expandVmSwapFilename(void) {
+    char *p = strstr(server.vm_swap_file,"%p");
+    sds new;
+    
+    if (!p) return;
+    new = sdsempty();
+    *p = '\0';
+    new = sdscat(new,server.vm_swap_file);
+    new = sdscatprintf(new,"%ld",(long) getpid());
+    new = sdscat(new,p+2);
+    zfree(server.vm_swap_file);
+    server.vm_swap_file = new;
+}
+
+static void vmInit(void) {
+    off_t totsize;
+    int pipefds[2];
+    size_t stacksize;
+
+    if (server.vm_max_threads != 0)
+        zmalloc_enable_thread_safeness(); /* we need thread safe zmalloc() */
+
+    expandVmSwapFilename();
+    redisLog(REDIS_NOTICE,"Using '%s' as swap file",server.vm_swap_file);
+    if ((server.vm_fp = fopen(server.vm_swap_file,"r+b")) == NULL) {
+        server.vm_fp = fopen(server.vm_swap_file,"w+b");
+    }
+    if (server.vm_fp == NULL) {
+        redisLog(REDIS_WARNING,
+            "Impossible to open the swap file: %s. Exiting.",
+            strerror(errno));
+        exit(1);
+    }
+    server.vm_fd = fileno(server.vm_fp);
+    server.vm_next_page = 0;
+    server.vm_near_pages = 0;
+    server.vm_stats_used_pages = 0;
+    server.vm_stats_swapped_objects = 0;
+    server.vm_stats_swapouts = 0;
+    server.vm_stats_swapins = 0;
+    totsize = server.vm_pages*server.vm_page_size;
+    redisLog(REDIS_NOTICE,"Allocating %lld bytes of swap file",totsize);
+    if (ftruncate(server.vm_fd,totsize) == -1) {
+        redisLog(REDIS_WARNING,"Can't ftruncate swap file: %s. Exiting.",
+            strerror(errno));
+        exit(1);
+    } else {
+        redisLog(REDIS_NOTICE,"Swap file allocated with success");
+    }
+    server.vm_bitmap = zmalloc((server.vm_pages+7)/8);
+    redisLog(REDIS_VERBOSE,"Allocated %lld bytes page table for %lld pages",
+        (long long) (server.vm_pages+7)/8, server.vm_pages);
+    memset(server.vm_bitmap,0,(server.vm_pages+7)/8);
+
+    /* Initialize threaded I/O (used by Virtual Memory) */
+    server.io_newjobs = listCreate();
+    server.io_processing = listCreate();
+    server.io_processed = listCreate();
+    server.io_ready_clients = listCreate();
+    pthread_mutex_init(&server.io_mutex,NULL);
+    pthread_mutex_init(&server.obj_freelist_mutex,NULL);
+    pthread_mutex_init(&server.io_swapfile_mutex,NULL);
+    server.io_active_threads = 0;
+    if (pipe(pipefds) == -1) {
+        redisLog(REDIS_WARNING,"Unable to intialized VM: pipe(2): %s. Exiting."
+            ,strerror(errno));
+        exit(1);
+    }
+    server.io_ready_pipe_read = pipefds[0];
+    server.io_ready_pipe_write = pipefds[1];
+    redisAssert(anetNonBlock(NULL,server.io_ready_pipe_read) != ANET_ERR);
+    /* LZF requires a lot of stack */
+    pthread_attr_init(&server.io_threads_attr);
+    pthread_attr_getstacksize(&server.io_threads_attr, &stacksize);
+    while (stacksize < REDIS_THREAD_STACK_SIZE) stacksize *= 2;
+    pthread_attr_setstacksize(&server.io_threads_attr, stacksize);
+    /* Listen for events in the threaded I/O pipe */
+    if (aeCreateFileEvent(server.el, server.io_ready_pipe_read, AE_READABLE,
+        vmThreadedIOCompletedJob, NULL) == AE_ERR)
+        oom("creating file event");
+}
+
+/* Mark the page as used */
+static void vmMarkPageUsed(off_t page) {
+    off_t byte = page/8;
+    int bit = page&7;
+    redisAssert(vmFreePage(page) == 1);
+    server.vm_bitmap[byte] |= 1<<bit;
+}
+
+/* Mark N contiguous pages as used, with 'page' being the first. */
+static void vmMarkPagesUsed(off_t page, off_t count) {
+    off_t j;
+
+    for (j = 0; j < count; j++)
+        vmMarkPageUsed(page+j);
+    server.vm_stats_used_pages += count;
+    redisLog(REDIS_DEBUG,"Mark USED pages: %lld pages at %lld\n",
+        (long long)count, (long long)page);
+}
+
+/* Mark the page as free */
+static void vmMarkPageFree(off_t page) {
+    off_t byte = page/8;
+    int bit = page&7;
+    redisAssert(vmFreePage(page) == 0);
+    server.vm_bitmap[byte] &= ~(1<<bit);
+}
+
+/* Mark N contiguous pages as free, with 'page' being the first. */
+static void vmMarkPagesFree(off_t page, off_t count) {
+    off_t j;
+
+    for (j = 0; j < count; j++)
+        vmMarkPageFree(page+j);
+    server.vm_stats_used_pages -= count;
+    redisLog(REDIS_DEBUG,"Mark FREE pages: %lld pages at %lld\n",
+        (long long)count, (long long)page);
+}
+
+/* Test if the page is free */
+static int vmFreePage(off_t page) {
+    off_t byte = page/8;
+    int bit = page&7;
+    return (server.vm_bitmap[byte] & (1<<bit)) == 0;
+}
+
+/* Find N contiguous free pages storing the first page of the cluster in *first.
+ * Returns REDIS_OK if it was able to find N contiguous pages, otherwise 
+ * REDIS_ERR is returned.
+ *
+ * This function uses a simple algorithm: we try to allocate
+ * REDIS_VM_MAX_NEAR_PAGES sequentially, when we reach this limit we start
+ * again from the start of the swap file searching for free spaces.
+ *
+ * If it looks pretty clear that there are no free pages near our offset
+ * we try to find less populated places doing a forward jump of
+ * REDIS_VM_MAX_RANDOM_JUMP, then we start scanning again a few pages
+ * without hurry, and then we jump again and so forth...
+ * 
+ * This function can be improved using a free list to avoid to guess
+ * too much, since we could collect data about freed pages.
+ *
+ * note: I implemented this function just after watching an episode of
+ * Battlestar Galactica, where the hybrid was continuing to say "JUMP!"
+ */
+static int vmFindContiguousPages(off_t *first, off_t n) {
+    off_t base, offset = 0, since_jump = 0, numfree = 0;
+
+    if (server.vm_near_pages == REDIS_VM_MAX_NEAR_PAGES) {
+        server.vm_near_pages = 0;
+        server.vm_next_page = 0;
+    }
+    server.vm_near_pages++; /* Yet another try for pages near to the old ones */
+    base = server.vm_next_page;
+
+    while(offset < server.vm_pages) {
+        off_t this = base+offset;
+
+        /* If we overflow, restart from page zero */
+        if (this >= server.vm_pages) {
+            this -= server.vm_pages;
+            if (this == 0) {
+                /* Just overflowed, what we found on tail is no longer
+                 * interesting, as it's no longer contiguous. */
+                numfree = 0;
+            }
+        }
+        if (vmFreePage(this)) {
+            /* This is a free page */
+            numfree++;
+            /* Already got N free pages? Return to the caller, with success */
+            if (numfree == n) {
+                *first = this-(n-1);
+                server.vm_next_page = this+1;
+                redisLog(REDIS_DEBUG, "FOUND CONTIGUOUS PAGES: %lld pages at %lld\n", (long long) n, (long long) *first);
+                return REDIS_OK;
+            }
+        } else {
+            /* The current one is not a free page */
+            numfree = 0;
+        }
+
+        /* Fast-forward if the current page is not free and we already
+         * searched enough near this place. */
+        since_jump++;
+        if (!numfree && since_jump >= REDIS_VM_MAX_RANDOM_JUMP/4) {
+            offset += random() % REDIS_VM_MAX_RANDOM_JUMP;
+            since_jump = 0;
+            /* Note that even if we rewind after the jump, we are don't need
+             * to make sure numfree is set to zero as we only jump *if* it
+             * is set to zero. */
+        } else {
+            /* Otherwise just check the next page */
+            offset++;
+        }
+    }
+    return REDIS_ERR;
+}
+
+/* Write the specified object at the specified page of the swap file */
+static int vmWriteObjectOnSwap(robj *o, off_t page) {
+    if (server.vm_enabled) pthread_mutex_lock(&server.io_swapfile_mutex);
+    if (fseeko(server.vm_fp,page*server.vm_page_size,SEEK_SET) == -1) {
+        if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
+        redisLog(REDIS_WARNING,
+            "Critical VM problem in vmSwapObjectBlocking(): can't seek: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+    rdbSaveObject(server.vm_fp,o);
+    if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
+    return REDIS_OK;
+}
+
+/* Swap the 'val' object relative to 'key' into disk. Store all the information
+ * needed to later retrieve the object into the key object.
+ * If we can't find enough contiguous empty pages to swap the object on disk
+ * REDIS_ERR is returned. */
+static int vmSwapObjectBlocking(robj *key, robj *val) {
+    off_t pages = rdbSavedObjectPages(val,NULL);
+    off_t page;
+
+    assert(key->storage == REDIS_VM_MEMORY);
+    assert(key->refcount == 1);
+    if (vmFindContiguousPages(&page,pages) == REDIS_ERR) return REDIS_ERR;
+    if (vmWriteObjectOnSwap(val,page) == REDIS_ERR) return REDIS_ERR;
+    key->vm.page = page;
+    key->vm.usedpages = pages;
+    key->storage = REDIS_VM_SWAPPED;
+    key->vtype = val->type;
+    decrRefCount(val); /* Deallocate the object from memory. */
+    vmMarkPagesUsed(page,pages);
+    redisLog(REDIS_DEBUG,"VM: object %s swapped out at %lld (%lld pages)",
+        (unsigned char*) key->ptr,
+        (unsigned long long) page, (unsigned long long) pages);
+    server.vm_stats_swapped_objects++;
+    server.vm_stats_swapouts++;
+    fflush(server.vm_fp);
+    return REDIS_OK;
+}
+
+static robj *vmReadObjectFromSwap(off_t page, int type) {
+    robj *o;
+
+    if (server.vm_enabled) pthread_mutex_lock(&server.io_swapfile_mutex);
+    if (fseeko(server.vm_fp,page*server.vm_page_size,SEEK_SET) == -1) {
+        redisLog(REDIS_WARNING,
+            "Unrecoverable VM problem in vmReadObjectFromSwap(): can't seek: %s",
+            strerror(errno));
+        _exit(1);
+    }
+    o = rdbLoadObject(type,server.vm_fp);
+    if (o == NULL) {
+        redisLog(REDIS_WARNING, "Unrecoverable VM problem in vmReadObjectFromSwap(): can't load object from swap file: %s", strerror(errno));
+        _exit(1);
+    }
+    if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
+    return o;
+}
+
+/* Load the value object relative to the 'key' object from swap to memory.
+ * The newly allocated object is returned.
+ *
+ * If preview is true the unserialized object is returned to the caller but
+ * no changes are made to the key object, nor the pages are marked as freed */
+static robj *vmGenericLoadObject(robj *key, int preview) {
+    robj *val;
+
+    redisAssert(key->storage == REDIS_VM_SWAPPED || key->storage == REDIS_VM_LOADING);
+    val = vmReadObjectFromSwap(key->vm.page,key->vtype);
+    if (!preview) {
+        key->storage = REDIS_VM_MEMORY;
+        key->vm.atime = server.unixtime;
+        vmMarkPagesFree(key->vm.page,key->vm.usedpages);
+        redisLog(REDIS_DEBUG, "VM: object %s loaded from disk",
+            (unsigned char*) key->ptr);
+        server.vm_stats_swapped_objects--;
+    } else {
+        redisLog(REDIS_DEBUG, "VM: object %s previewed from disk",
+            (unsigned char*) key->ptr);
+    }
+    server.vm_stats_swapins++;
+    return val;
+}
+
+/* Plain object loading, from swap to memory */
+static robj *vmLoadObject(robj *key) {
+    /* If we are loading the object in background, stop it, we
+     * need to load this object synchronously ASAP. */
+    if (key->storage == REDIS_VM_LOADING)
+        vmCancelThreadedIOJob(key);
+    return vmGenericLoadObject(key,0);
+}
+
+/* Just load the value on disk, without to modify the key.
+ * This is useful when we want to perform some operation on the value
+ * without to really bring it from swap to memory, like while saving the
+ * dataset or rewriting the append only log. */
+static robj *vmPreviewObject(robj *key) {
+    return vmGenericLoadObject(key,1);
+}
+
+/* How a good candidate is this object for swapping?
+ * The better candidate it is, the greater the returned value.
+ *
+ * Currently we try to perform a fast estimation of the object size in
+ * memory, and combine it with aging informations.
+ *
+ * Basically swappability = idle-time * log(estimated size)
+ *
+ * Bigger objects are preferred over smaller objects, but not
+ * proportionally, this is why we use the logarithm. This algorithm is
+ * just a first try and will probably be tuned later. */
+static double computeObjectSwappability(robj *o) {
+    time_t age = server.unixtime - o->vm.atime;
+    long asize = 0;
+    list *l;
+    dict *d;
+    struct dictEntry *de;
+    int z;
+
+    if (age <= 0) return 0;
+    switch(o->type) {
+    case REDIS_STRING:
+        if (o->encoding != REDIS_ENCODING_RAW) {
+            asize = sizeof(*o);
+        } else {
+            asize = sdslen(o->ptr)+sizeof(*o)+sizeof(long)*2;
+        }
+        break;
+    case REDIS_LIST:
+        l = o->ptr;
+        listNode *ln = listFirst(l);
+
+        asize = sizeof(list);
+        if (ln) {
+            robj *ele = ln->value;
+            long elesize;
+
+            elesize = (ele->encoding == REDIS_ENCODING_RAW) ?
+                            (sizeof(*o)+sdslen(ele->ptr)) :
+                            sizeof(*o);
+            asize += (sizeof(listNode)+elesize)*listLength(l);
+        }
+        break;
+    case REDIS_SET:
+    case REDIS_ZSET:
+        z = (o->type == REDIS_ZSET);
+        d = z ? ((zset*)o->ptr)->dict : o->ptr;
+
+        asize = sizeof(dict)+(sizeof(struct dictEntry*)*dictSlots(d));
+        if (z) asize += sizeof(zset)-sizeof(dict);
+        if (dictSize(d)) {
+            long elesize;
+            robj *ele;
+
+            de = dictGetRandomKey(d);
+            ele = dictGetEntryKey(de);
+            elesize = (ele->encoding == REDIS_ENCODING_RAW) ?
+                            (sizeof(*o)+sdslen(ele->ptr)) :
+                            sizeof(*o);
+            asize += (sizeof(struct dictEntry)+elesize)*dictSize(d);
+            if (z) asize += sizeof(zskiplistNode)*dictSize(d);
+        }
+        break;
+    }
+    return (double)asize*log(1+asize);
+}
+
+/* Try to swap an object that's a good candidate for swapping.
+ * Returns REDIS_OK if the object was swapped, REDIS_ERR if it's not possible
+ * to swap any object at all.
+ *
+ * If 'usethreaded' is true, Redis will try to swap the object in background
+ * using I/O threads. */
+static int vmSwapOneObject(int usethreads) {
+    int j, i;
+    struct dictEntry *best = NULL;
+    double best_swappability = 0;
+    redisDb *best_db = NULL;
+    robj *key, *val;
+
+    for (j = 0; j < server.dbnum; j++) {
+        redisDb *db = server.db+j;
+        /* Why maxtries is set to 100?
+         * Because this way (usually) we'll find 1 object even if just 1% - 2%
+         * are swappable objects */
+        int maxtries = 100;
+
+        if (dictSize(db->dict) == 0) continue;
+        for (i = 0; i < 5; i++) {
+            dictEntry *de;
+            double swappability;
+
+            if (maxtries) maxtries--;
+            de = dictGetRandomKey(db->dict);
+            key = dictGetEntryKey(de);
+            val = dictGetEntryVal(de);
+            /* Only swap objects that are currently in memory.
+             *
+             * Also don't swap shared objects if threaded VM is on, as we
+             * try to ensure that the main thread does not touch the
+             * object while the I/O thread is using it, but we can't
+             * control other keys without adding additional mutex. */
+            if (key->storage != REDIS_VM_MEMORY ||
+                (server.vm_max_threads != 0 && val->refcount != 1)) {
+                if (maxtries) i--; /* don't count this try */
+                continue;
+            }
+            swappability = computeObjectSwappability(val);
+            if (!best || swappability > best_swappability) {
+                best = de;
+                best_swappability = swappability;
+                best_db = db;
+            }
+        }
+    }
+    if (best == NULL) return REDIS_ERR;
+    key = dictGetEntryKey(best);
+    val = dictGetEntryVal(best);
+
+    redisLog(REDIS_DEBUG,"Key with best swappability: %s, %f",
+        key->ptr, best_swappability);
+
+    /* Unshare the key if needed */
+    if (key->refcount > 1) {
+        robj *newkey = dupStringObject(key);
+        decrRefCount(key);
+        key = dictGetEntryKey(best) = newkey;
+    }
+    /* Swap it */
+    if (usethreads) {
+        vmSwapObjectThreaded(key,val,best_db);
+        return REDIS_OK;
+    } else {
+        if (vmSwapObjectBlocking(key,val) == REDIS_OK) {
+            dictGetEntryVal(best) = NULL;
+            return REDIS_OK;
+        } else {
+            return REDIS_ERR;
+        }
+    }
+}
+
+static int vmSwapOneObjectBlocking() {
+    return vmSwapOneObject(0);
+}
+
+static int vmSwapOneObjectThreaded() {
+    return vmSwapOneObject(1);
+}
+
+/* Return true if it's safe to swap out objects in a given moment.
+ * Basically we don't want to swap objects out while there is a BGSAVE
+ * or a BGAEOREWRITE running in backgroud. */
+static int vmCanSwapOut(void) {
+    return (server.bgsavechildpid == -1 && server.bgrewritechildpid == -1);
+}
+
+/* Delete a key if swapped. Returns 1 if the key was found, was swapped
+ * and was deleted. Otherwise 0 is returned. */
+static int deleteIfSwapped(redisDb *db, robj *key) {
+    dictEntry *de;
+    robj *foundkey;
+
+    if ((de = dictFind(db->dict,key)) == NULL) return 0;
+    foundkey = dictGetEntryKey(de);
+    if (foundkey->storage == REDIS_VM_MEMORY) return 0;
+    deleteKey(db,key);
+    return 1;
+}
+
+/* =================== Virtual Memory - Threaded I/O  ======================= */
+
+static void freeIOJob(iojob *j) {
+    if ((j->type == REDIS_IOJOB_PREPARE_SWAP ||
+        j->type == REDIS_IOJOB_DO_SWAP ||
+        j->type == REDIS_IOJOB_LOAD) && j->val != NULL)
+        decrRefCount(j->val);
+    decrRefCount(j->key);
+    zfree(j);
+}
+
+/* Every time a thread finished a Job, it writes a byte into the write side
+ * of an unix pipe in order to "awake" the main thread, and this function
+ * is called. */
+static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
+            int mask)
+{
+    char buf[1];
+    int retval, processed = 0, toprocess = -1, trytoswap = 1;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(privdata);
+
+    /* For every byte we read in the read side of the pipe, there is one
+     * I/O job completed to process. */
+    while((retval = read(fd,buf,1)) == 1) {
+        iojob *j;
+        listNode *ln;
+        robj *key;
+        struct dictEntry *de;
+
+        redisLog(REDIS_DEBUG,"Processing I/O completed job");
+
+        /* Get the processed element (the oldest one) */
+        lockThreadedIO();
+        assert(listLength(server.io_processed) != 0);
+        if (toprocess == -1) {
+            toprocess = (listLength(server.io_processed)*REDIS_MAX_COMPLETED_JOBS_PROCESSED)/100;
+            if (toprocess <= 0) toprocess = 1;
+        }
+        ln = listFirst(server.io_processed);
+        j = ln->value;
+        listDelNode(server.io_processed,ln);
+        unlockThreadedIO();
+        /* If this job is marked as canceled, just ignore it */
+        if (j->canceled) {
+            freeIOJob(j);
+            continue;
+        }
+        /* Post process it in the main thread, as there are things we
+         * can do just here to avoid race conditions and/or invasive locks */
+        redisLog(REDIS_DEBUG,"Job %p type: %d, key at %p (%s) refcount: %d\n", (void*) j, j->type, (void*)j->key, (char*)j->key->ptr, j->key->refcount);
+        de = dictFind(j->db->dict,j->key);
+        assert(de != NULL);
+        key = dictGetEntryKey(de);
+        if (j->type == REDIS_IOJOB_LOAD) {
+            redisDb *db;
+
+            /* Key loaded, bring it at home */
+            key->storage = REDIS_VM_MEMORY;
+            key->vm.atime = server.unixtime;
+            vmMarkPagesFree(key->vm.page,key->vm.usedpages);
+            redisLog(REDIS_DEBUG, "VM: object %s loaded from disk (threaded)",
+                (unsigned char*) key->ptr);
+            server.vm_stats_swapped_objects--;
+            server.vm_stats_swapins++;
+            dictGetEntryVal(de) = j->val;
+            incrRefCount(j->val);
+            db = j->db;
+            freeIOJob(j);
+            /* Handle clients waiting for this key to be loaded. */
+            handleClientsBlockedOnSwappedKey(db,key);
+        } else if (j->type == REDIS_IOJOB_PREPARE_SWAP) {
+            /* Now we know the amount of pages required to swap this object.
+             * Let's find some space for it, and queue this task again
+             * rebranded as REDIS_IOJOB_DO_SWAP. */
+            if (!vmCanSwapOut() ||
+                vmFindContiguousPages(&j->page,j->pages) == REDIS_ERR)
+            {
+                /* Ooops... no space or we can't swap as there is
+                 * a fork()ed Redis trying to save stuff on disk. */
+                freeIOJob(j);
+                key->storage = REDIS_VM_MEMORY; /* undo operation */
+            } else {
+                /* Note that we need to mark this pages as used now,
+                 * if the job will be canceled, we'll mark them as freed
+                 * again. */
+                vmMarkPagesUsed(j->page,j->pages);
+                j->type = REDIS_IOJOB_DO_SWAP;
+                lockThreadedIO();
+                queueIOJob(j);
+                unlockThreadedIO();
+            }
+        } else if (j->type == REDIS_IOJOB_DO_SWAP) {
+            robj *val;
+
+            /* Key swapped. We can finally free some memory. */
+            if (key->storage != REDIS_VM_SWAPPING) {
+                printf("key->storage: %d\n",key->storage);
+                printf("key->name: %s\n",(char*)key->ptr);
+                printf("key->refcount: %d\n",key->refcount);
+                printf("val: %p\n",(void*)j->val);
+                printf("val->type: %d\n",j->val->type);
+                printf("val->ptr: %s\n",(char*)j->val->ptr);
+            }
+            redisAssert(key->storage == REDIS_VM_SWAPPING);
+            val = dictGetEntryVal(de);
+            key->vm.page = j->page;
+            key->vm.usedpages = j->pages;
+            key->storage = REDIS_VM_SWAPPED;
+            key->vtype = j->val->type;
+            decrRefCount(val); /* Deallocate the object from memory. */
+            dictGetEntryVal(de) = NULL;
+            redisLog(REDIS_DEBUG,
+                "VM: object %s swapped out at %lld (%lld pages) (threaded)",
+                (unsigned char*) key->ptr,
+                (unsigned long long) j->page, (unsigned long long) j->pages);
+            server.vm_stats_swapped_objects++;
+            server.vm_stats_swapouts++;
+            freeIOJob(j);
+            /* Put a few more swap requests in queue if we are still
+             * out of memory */
+            if (trytoswap && vmCanSwapOut() &&
+                zmalloc_used_memory() > server.vm_max_memory)
+            {
+                int more = 1;
+                while(more) {
+                    lockThreadedIO();
+                    more = listLength(server.io_newjobs) <
+                            (unsigned) server.vm_max_threads;
+                    unlockThreadedIO();
+                    /* Don't waste CPU time if swappable objects are rare. */
+                    if (vmSwapOneObjectThreaded() == REDIS_ERR) {
+                        trytoswap = 0;
+                        break;
+                    }
+                }
+            }
+        }
+        processed++;
+        if (processed == toprocess) return;
+    }
+    if (retval < 0 && errno != EAGAIN) {
+        redisLog(REDIS_WARNING,
+            "WARNING: read(2) error in vmThreadedIOCompletedJob() %s",
+            strerror(errno));
+    }
+}
+
+static void lockThreadedIO(void) {
+    pthread_mutex_lock(&server.io_mutex);
+}
+
+static void unlockThreadedIO(void) {
+    pthread_mutex_unlock(&server.io_mutex);
+}
+
+/* Remove the specified object from the threaded I/O queue if still not
+ * processed, otherwise make sure to flag it as canceled. */
+static void vmCancelThreadedIOJob(robj *o) {
+    list *lists[3] = {
+        server.io_newjobs,      /* 0 */
+        server.io_processing,   /* 1 */
+        server.io_processed     /* 2 */
+    };
+    int i;
+
+    assert(o->storage == REDIS_VM_LOADING || o->storage == REDIS_VM_SWAPPING);
+again:
+    lockThreadedIO();
+    /* Search for a matching key in one of the queues */
+    for (i = 0; i < 3; i++) {
+        listNode *ln;
+        listIter li;
+
+        listRewind(lists[i],&li);
+        while ((ln = listNext(&li)) != NULL) {
+            iojob *job = ln->value;
+
+            if (job->canceled) continue; /* Skip this, already canceled. */
+            if (compareStringObjects(job->key,o) == 0) {
+                redisLog(REDIS_DEBUG,"*** CANCELED %p (%s) (type %d) (LIST ID %d)\n",
+                    (void*)job, (char*)o->ptr, job->type, i);
+                /* Mark the pages as free since the swap didn't happened
+                 * or happened but is now discarded. */
+                if (i != 1 && job->type == REDIS_IOJOB_DO_SWAP)
+                    vmMarkPagesFree(job->page,job->pages);
+                /* Cancel the job. It depends on the list the job is
+                 * living in. */
+                switch(i) {
+                case 0: /* io_newjobs */
+                    /* If the job was yet not processed the best thing to do
+                     * is to remove it from the queue at all */
+                    freeIOJob(job);
+                    listDelNode(lists[i],ln);
+                    break;
+                case 1: /* io_processing */
+                    /* Oh Shi- the thread is messing with the Job:
+                     *
+                     * Probably it's accessing the object if this is a
+                     * PREPARE_SWAP or DO_SWAP job.
+                     * If it's a LOAD job it may be reading from disk and
+                     * if we don't wait for the job to terminate before to
+                     * cancel it, maybe in a few microseconds data can be
+                     * corrupted in this pages. So the short story is:
+                     *
+                     * Better to wait for the job to move into the
+                     * next queue (processed)... */
+
+                    /* We try again and again until the job is completed. */
+                    unlockThreadedIO();
+                    /* But let's wait some time for the I/O thread
+                     * to finish with this job. After all this condition
+                     * should be very rare. */
+                    usleep(1);
+                    goto again;
+                case 2: /* io_processed */
+                    /* The job was already processed, that's easy...
+                     * just mark it as canceled so that we'll ignore it
+                     * when processing completed jobs. */
+                    job->canceled = 1;
+                    break;
+                }
+                /* Finally we have to adjust the storage type of the object
+                 * in order to "UNDO" the operaiton. */
+                if (o->storage == REDIS_VM_LOADING)
+                    o->storage = REDIS_VM_SWAPPED;
+                else if (o->storage == REDIS_VM_SWAPPING)
+                    o->storage = REDIS_VM_MEMORY;
+                unlockThreadedIO();
+                return;
+            }
+        }
+    }
+    unlockThreadedIO();
+    assert(1 != 1); /* We should never reach this */
+}
+
+static void *IOThreadEntryPoint(void *arg) {
+    iojob *j;
+    listNode *ln;
+    REDIS_NOTUSED(arg);
+
+    pthread_detach(pthread_self());
+    while(1) {
+        /* Get a new job to process */
+        lockThreadedIO();
+        if (listLength(server.io_newjobs) == 0) {
+            /* No new jobs in queue, exit. */
+            redisLog(REDIS_DEBUG,"Thread %lld exiting, nothing to do",
+                (long long) pthread_self());
+            server.io_active_threads--;
+            unlockThreadedIO();
+            return NULL;
+        }
+        ln = listFirst(server.io_newjobs);
+        j = ln->value;
+        listDelNode(server.io_newjobs,ln);
+        /* Add the job in the processing queue */
+        j->thread = pthread_self();
+        listAddNodeTail(server.io_processing,j);
+        ln = listLast(server.io_processing); /* We use ln later to remove it */
+        unlockThreadedIO();
+        redisLog(REDIS_DEBUG,"Thread %lld got a new job (type %d): %p about key '%s'",
+            (long long) pthread_self(), j->type, (void*)j, (char*)j->key->ptr);
+
+        /* Process the Job */
+        if (j->type == REDIS_IOJOB_LOAD) {
+            j->val = vmReadObjectFromSwap(j->page,j->key->vtype);
+        } else if (j->type == REDIS_IOJOB_PREPARE_SWAP) {
+            FILE *fp = fopen("/dev/null","w+");
+            j->pages = rdbSavedObjectPages(j->val,fp);
+            fclose(fp);
+        } else if (j->type == REDIS_IOJOB_DO_SWAP) {
+            if (vmWriteObjectOnSwap(j->val,j->page) == REDIS_ERR)
+                j->canceled = 1;
+        }
+
+        /* Done: insert the job into the processed queue */
+        redisLog(REDIS_DEBUG,"Thread %lld completed the job: %p (key %s)",
+            (long long) pthread_self(), (void*)j, (char*)j->key->ptr);
+        lockThreadedIO();
+        listDelNode(server.io_processing,ln);
+        listAddNodeTail(server.io_processed,j);
+        unlockThreadedIO();
+        
+        /* Signal the main thread there is new stuff to process */
+        assert(write(server.io_ready_pipe_write,"x",1) == 1);
+    }
+    return NULL; /* never reached */
+}
+
+static void spawnIOThread(void) {
+    pthread_t thread;
+    sigset_t mask, omask;
+
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGCHLD);
+    sigaddset(&mask,SIGHUP);
+    sigaddset(&mask,SIGPIPE);
+    pthread_sigmask(SIG_SETMASK, &mask, &omask);
+    pthread_create(&thread,&server.io_threads_attr,IOThreadEntryPoint,NULL);
+    pthread_sigmask(SIG_SETMASK, &omask, NULL);
+    server.io_active_threads++;
+}
+
+/* We need to wait for the last thread to exit before we are able to
+ * fork() in order to BGSAVE or BGREWRITEAOF. */
+static void waitEmptyIOJobsQueue(void) {
+    while(1) {
+        int io_processed_len;
+
+        lockThreadedIO();
+        if (listLength(server.io_newjobs) == 0 &&
+            listLength(server.io_processing) == 0 &&
+            server.io_active_threads == 0)
+        {
+            unlockThreadedIO();
+            return;
+        }
+        /* While waiting for empty jobs queue condition we post-process some
+         * finshed job, as I/O threads may be hanging trying to write against
+         * the io_ready_pipe_write FD but there are so much pending jobs that
+         * it's blocking. */
+        io_processed_len = listLength(server.io_processed);
+        unlockThreadedIO();
+        if (io_processed_len) {
+            vmThreadedIOCompletedJob(NULL,server.io_ready_pipe_read,NULL,0);
+            usleep(1000); /* 1 millisecond */
+        } else {
+            usleep(10000); /* 10 milliseconds */
+        }
+    }
+}
+
+static void vmReopenSwapFile(void) {
+    /* Note: we don't close the old one as we are in the child process
+     * and don't want to mess at all with the original file object. */
+    server.vm_fp = fopen(server.vm_swap_file,"r+b");
+    if (server.vm_fp == NULL) {
+        redisLog(REDIS_WARNING,"Can't re-open the VM swap file: %s. Exiting.",
+            server.vm_swap_file);
+        _exit(1);
+    }
+    server.vm_fd = fileno(server.vm_fp);
+}
+
+/* This function must be called while with threaded IO locked */
+static void queueIOJob(iojob *j) {
+    redisLog(REDIS_DEBUG,"Queued IO Job %p type %d about key '%s'\n",
+        (void*)j, j->type, (char*)j->key->ptr);
+    listAddNodeTail(server.io_newjobs,j);
+    if (server.io_active_threads < server.vm_max_threads)
+        spawnIOThread();
+}
+
+static int vmSwapObjectThreaded(robj *key, robj *val, redisDb *db) {
+    iojob *j;
+    
+    assert(key->storage == REDIS_VM_MEMORY);
+    assert(key->refcount == 1);
+
+    j = zmalloc(sizeof(*j));
+    j->type = REDIS_IOJOB_PREPARE_SWAP;
+    j->db = db;
+    j->key = dupStringObject(key);
+    j->val = val;
+    incrRefCount(val);
+    j->canceled = 0;
+    j->thread = (pthread_t) -1;
+    key->storage = REDIS_VM_SWAPPING;
+
+    lockThreadedIO();
+    queueIOJob(j);
+    unlockThreadedIO();
+    return REDIS_OK;
+}
+
+/* ============ Virtual Memory - Blocking clients on missing keys =========== */
+
+/* This function makes the clinet 'c' waiting for the key 'key' to be loaded.
+ * If there is not already a job loading the key, it is craeted.
+ * The key is added to the io_keys list in the client structure, and also
+ * in the hash table mapping swapped keys to waiting clients, that is,
+ * server.io_waited_keys. */
+static int waitForSwappedKey(redisClient *c, robj *key) {
+    struct dictEntry *de;
+    robj *o;
+    list *l;
+
+    /* If the key does not exist or is already in RAM we don't need to
+     * block the client at all. */
+    de = dictFind(c->db->dict,key);
+    if (de == NULL) return 0;
+    o = dictGetEntryKey(de);
+    if (o->storage == REDIS_VM_MEMORY) {
+        return 0;
+    } else if (o->storage == REDIS_VM_SWAPPING) {
+        /* We were swapping the key, undo it! */
+        vmCancelThreadedIOJob(o);
+        return 0;
+    }
+    
+    /* OK: the key is either swapped, or being loaded just now. */
+
+    /* Add the key to the list of keys this client is waiting for.
+     * This maps clients to keys they are waiting for. */
+    listAddNodeTail(c->io_keys,key);
+    incrRefCount(key);
+
+    /* Add the client to the swapped keys => clients waiting map. */
+    de = dictFind(c->db->io_keys,key);
+    if (de == NULL) {
+        int retval;
+
+        /* For every key we take a list of clients blocked for it */
+        l = listCreate();
+        retval = dictAdd(c->db->io_keys,key,l);
+        incrRefCount(key);
+        assert(retval == DICT_OK);
+    } else {
+        l = dictGetEntryVal(de);
+    }
+    listAddNodeTail(l,c);
+
+    /* Are we already loading the key from disk? If not create a job */
+    if (o->storage == REDIS_VM_SWAPPED) {
+        iojob *j;
+
+        o->storage = REDIS_VM_LOADING;
+        j = zmalloc(sizeof(*j));
+        j->type = REDIS_IOJOB_LOAD;
+        j->db = c->db;
+        j->key = dupStringObject(key);
+        j->key->vtype = o->vtype;
+        j->page = o->vm.page;
+        j->val = NULL;
+        j->canceled = 0;
+        j->thread = (pthread_t) -1;
+        lockThreadedIO();
+        queueIOJob(j);
+        unlockThreadedIO();
+    }
+    return 1;
+}
+
+/* Is this client attempting to run a command against swapped keys?
+ * If so, block it ASAP, load the keys in background, then resume it.
+ *
+ * The important idea about this function is that it can fail! If keys will
+ * still be swapped when the client is resumed, this key lookups will
+ * just block loading keys from disk. In practical terms this should only
+ * happen with SORT BY command or if there is a bug in this function.
+ *
+ * Return 1 if the client is marked as blocked, 0 if the client can
+ * continue as the keys it is going to access appear to be in memory. */
+static int blockClientOnSwappedKeys(struct redisCommand *cmd, redisClient *c) {
+    int j, last;
+
+    if (cmd->vm_firstkey == 0) return 0;
+    last = cmd->vm_lastkey;
+    if (last < 0) last = c->argc+last;
+    for (j = cmd->vm_firstkey; j <= last; j += cmd->vm_keystep)
+        waitForSwappedKey(c,c->argv[j]);
+    /* If the client was blocked for at least one key, mark it as blocked. */
+    if (listLength(c->io_keys)) {
+        c->flags |= REDIS_IO_WAIT;
+        aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+        server.vm_blocked_clients++;
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/* Remove the 'key' from the list of blocked keys for a given client.
+ *
+ * The function returns 1 when there are no longer blocking keys after
+ * the current one was removed (and the client can be unblocked). */
+static int dontWaitForSwappedKey(redisClient *c, robj *key) {
+    list *l;
+    listNode *ln;
+    listIter li;
+    struct dictEntry *de;
+
+    /* Remove the key from the list of keys this client is waiting for. */
+    listRewind(c->io_keys,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        if (compareStringObjects(ln->value,key) == 0) {
+            listDelNode(c->io_keys,ln);
+            break;
+        }
+    }
+    assert(ln != NULL);
+
+    /* Remove the client form the key => waiting clients map. */
+    de = dictFind(c->db->io_keys,key);
+    assert(de != NULL);
+    l = dictGetEntryVal(de);
+    ln = listSearchKey(l,c);
+    assert(ln != NULL);
+    listDelNode(l,ln);
+    if (listLength(l) == 0)
+        dictDelete(c->db->io_keys,key);
+
+    return listLength(c->io_keys) == 0;
+}
+
+static void handleClientsBlockedOnSwappedKey(redisDb *db, robj *key) {
+    struct dictEntry *de;
+    list *l;
+    listNode *ln;
+    int len;
+
+    de = dictFind(db->io_keys,key);
+    if (!de) return;
+
+    l = dictGetEntryVal(de);
+    len = listLength(l);
+    /* Note: we can't use something like while(listLength(l)) as the list
+     * can be freed by the calling function when we remove the last element. */
+    while (len--) {
+        ln = listFirst(l);
+        redisClient *c = ln->value;
+
+        if (dontWaitForSwappedKey(c,key)) {
+            /* Put the client in the list of clients ready to go as we
+             * loaded all the keys about it. */
+            listAddNodeTail(server.io_ready_clients,c);
+        }
+    }
+}
+
 /* ================================= Debugging ============================== */
 
 static void debugCommand(redisClient *c) {
@@ -6537,19 +8505,58 @@ static void debugCommand(redisClient *c) {
         }
         key = dictGetEntryKey(de);
         val = dictGetEntryVal(de);
-        addReplySds(c,sdscatprintf(sdsempty(),
-            "+Key at:%p refcount:%d, value at:%p refcount:%d encoding:%d\r\n",
+        if (!server.vm_enabled || (key->storage == REDIS_VM_MEMORY ||
+                                   key->storage == REDIS_VM_SWAPPING)) {
+            addReplySds(c,sdscatprintf(sdsempty(),
+                "+Key at:%p refcount:%d, value at:%p refcount:%d "
+                "encoding:%d serializedlength:%lld\r\n",
                 (void*)key, key->refcount, (void*)val, val->refcount,
-                val->encoding));
+                val->encoding, (long long) rdbSavedObjectLen(val,NULL)));
+        } else {
+            addReplySds(c,sdscatprintf(sdsempty(),
+                "+Key at:%p refcount:%d, value swapped at: page %llu "
+                "using %llu pages\r\n",
+                (void*)key, key->refcount, (unsigned long long) key->vm.page,
+                (unsigned long long) key->vm.usedpages));
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"swapout") && c->argc == 3) {
+        dictEntry *de = dictFind(c->db->dict,c->argv[2]);
+        robj *key, *val;
+
+        if (!server.vm_enabled) {
+            addReplySds(c,sdsnew("-ERR Virtual Memory is disabled\r\n"));
+            return;
+        }
+        if (!de) {
+            addReply(c,shared.nokeyerr);
+            return;
+        }
+        key = dictGetEntryKey(de);
+        val = dictGetEntryVal(de);
+        /* If the key is shared we want to create a copy */
+        if (key->refcount > 1) {
+            robj *newkey = dupStringObject(key);
+            decrRefCount(key);
+            key = dictGetEntryKey(de) = newkey;
+        }
+        /* Swap it */
+        if (key->storage != REDIS_VM_MEMORY) {
+            addReplySds(c,sdsnew("-ERR This key is not in memory\r\n"));
+        } else if (vmSwapObjectBlocking(key,val) == REDIS_OK) {
+            dictGetEntryVal(de) = NULL;
+            addReply(c,shared.ok);
+        } else {
+            addReply(c,shared.err);
+        }
     } else {
         addReplySds(c,sdsnew(
-            "-ERR Syntax error, try DEBUG [SEGFAULT|OBJECT <key>|RELOAD]\r\n"));
+            "-ERR Syntax error, try DEBUG [SEGFAULT|OBJECT <key>|SWAPOUT <key>|RELOAD]\r\n"));
     }
 }
 
-static void _redisAssert(char *estr) {
+static void _redisAssert(char *estr, char *file, int line) {
     redisLog(REDIS_WARNING,"=== ASSERTION FAILED ===");
-    redisLog(REDIS_WARNING,"==> %s\n",estr);
+    redisLog(REDIS_WARNING,"==> %s:%d '%s' is not true\n",file,line,estr);
 #ifdef HAVE_BACKTRACE
     redisLog(REDIS_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
     *((char*)-1) = 'x';
@@ -6585,7 +8592,6 @@ static void daemonize(void) {
     FILE *fp;
 
     if (fork() != 0) exit(0); /* parent exits */
-    printf("New pid: %d\n", getpid());
     setsid(); /* create a new session */
 
     /* Every output goes to /dev/null. If Redis is daemonized but
@@ -6606,6 +8612,8 @@ static void daemonize(void) {
 }
 
 int main(int argc, char **argv) {
+    time_t start;
+
     initServerConfig();
     if (argc == 2) {
         resetServerSaveParams();
@@ -6622,16 +8630,16 @@ int main(int argc, char **argv) {
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
 #endif
+    start = time(NULL);
     if (server.appendonly) {
         if (loadAppendOnlyFile(server.appendfilename) == REDIS_OK)
-            redisLog(REDIS_NOTICE,"DB loaded from append only file");
+            redisLog(REDIS_NOTICE,"DB loaded from append only file: %ld seconds",time(NULL)-start);
     } else {
         if (rdbLoad(server.dbfilename) == REDIS_OK)
-            redisLog(REDIS_NOTICE,"DB loaded from disk");
+            redisLog(REDIS_NOTICE,"DB loaded from disk: %ld seconds",time(NULL)-start);
     }
-    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
-        acceptHandler, NULL) == AE_ERR) oom("creating file event");
     redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+    aeSetBeforeSleepProc(server.el,beforeSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
@@ -6659,8 +8667,8 @@ static void *getMcontextEip(ucontext_t *uc) {
   #else
     return (void*) uc->uc_mcontext->__ss.__eip;
   #endif 
-#elif defined(__i386__) || defined(__X86_64__) /* Linux x86 */
-    return (void*) uc->uc_mcontext.gregs[REG_EIP];
+#elif defined(__i386__) || defined(__X86_64__)  || defined(__x86_64__)
+    return (void*) uc->uc_mcontext.gregs[REG_EIP]; /* Linux 32/64 bit */
 #elif defined(__ia64__) /* Linux IA64 */
     return (void*) uc->uc_mcontext.sc_ip;
 #else
@@ -6701,8 +8709,8 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
             redisLog(REDIS_WARNING,"%d redis-server %p %s + %d", i, trace[i], fn, (unsigned int)offset);
         }
     }
-    // free(messages); Don't call free() with possibly corrupted memory.
-    exit(0);
+    /* free(messages); Don't call free() with possibly corrupted memory. */
+    _exit(0);
 }
 
 static void setupSigSegvAction(void) {
