@@ -1232,7 +1232,7 @@ proc main {server port} {
         list [$r zrange ztmp 0 -1] [$r zrevrange ztmp 0 -1]
     } {{y x z} {z x y}}
 
-    test {zrangeunionON} {
+    test {zrangeunion} {
         $r zadd zfoo 1 1
         $r zadd zfoo 2 2
         $r zadd zfoo 5 5
